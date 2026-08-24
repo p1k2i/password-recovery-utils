@@ -19,6 +19,8 @@ WARNING: the number of combinations grows combinatorially with
 """
 
 import argparse
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -145,10 +147,38 @@ def fmt_bytes(num_bytes: float) -> str:
     return f"{num_bytes:.1f} GB"
 
 
+def _enable_windows_vt_mode() -> bool:
+    """Try to turn on ANSI/VT escape processing for stderr on Windows
+    (Windows 10+ supports it, but legacy conhost windows have it off by
+    default). Returns True if escape sequences can be used afterwards."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        STD_ERROR_HANDLE = -12
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_ERROR_HANDLE)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if not kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 class ProgressReporter:
-    """Renders a 3-line, in-place-updating progress display (bar + %,
-    elapsed/ETA/rate, current output file) on stderr. Disabled
-    automatically when stderr isn't a terminal, or via --quiet."""
+    """Renders an in-place-updating progress display on stderr, the way
+    unix tools like wget/pip do (overwriting the same spot instead of
+    scrolling the console). Uses a 3-line ANSI display when the terminal
+    supports cursor movement (any unix tty, or Windows 10+ with VT
+    processing enabled); falls back to a single carriage-return-updated
+    line on terminals that don't (e.g. legacy Windows cmd.exe). Disabled
+    entirely when stderr isn't a terminal, or via --quiet."""
 
     BAR_WIDTH = 30
     MIN_INTERVAL = 0.15  # seconds between redraws, to keep overhead low
@@ -156,13 +186,20 @@ class ProgressReporter:
     def __init__(self, total_estimate: int, approx: bool, enabled: bool):
         self.total_estimate = max(total_estimate, 1)
         self.approx = approx
-        self.enabled = enabled and sys.stderr.isatty()
         self.start_time = time.monotonic()
         self._last_draw = 0.0
         self._drawn_once = False
 
+        is_tty = enabled and sys.stderr.isatty()
+        if not is_tty:
+            self.mode = "off"
+        elif _enable_windows_vt_mode():
+            self.mode = "ansi"
+        else:
+            self.mode = "line"
+
     def update(self, writer: "OutputWriter", force: bool = False) -> None:
-        if not self.enabled:
+        if self.mode == "off":
             return
         now = time.monotonic()
         if not force and (now - self._last_draw) < self.MIN_INTERVAL:
@@ -180,23 +217,35 @@ class ProgressReporter:
         filled = int(self.BAR_WIDTH * fraction)
         bar = "#" * filled + "-" * (self.BAR_WIDTH - filled)
 
-        line1 = f"[{bar}] {fraction * 100:5.1f}%{mark}  {written:,} / {self.total_estimate:,} words"
-        line2 = (f"Elapsed {fmt_duration(elapsed)}  ETA {fmt_duration(eta)}{mark}  "
-                 f"Rate {rate:,.0f} words/s")
-        line3 = (f"File {writer.current_path.name}  ({writer.file_index} written)  "
-                 f"{fmt_bytes(writer.current_size)}  {writer.current_count:,} words in file")
+        if self.mode == "ansi":
+            line1 = f"[{bar}] {fraction * 100:5.1f}%{mark}  {written:,} / {self.total_estimate:,} words"
+            line2 = (f"Elapsed {fmt_duration(elapsed)}  ETA {fmt_duration(eta)}{mark}  "
+                     f"Rate {rate:,.0f} words/s")
+            line3 = (f"File {writer.current_path.name}  ({writer.file_index} written)  "
+                     f"{fmt_bytes(writer.current_size)}  {writer.current_count:,} words in file")
 
-        out = sys.stderr
-        if self._drawn_once:
-            out.write("\033[3F")
-        self._drawn_once = True
-        out.write(f"\033[K{line1}\n\033[K{line2}\n\033[K{line3}\n")
-        out.flush()
+            out = sys.stderr
+            if self._drawn_once:
+                out.write("\033[3F")
+            self._drawn_once = True
+            out.write(f"\033[K{line1}\n\033[K{line2}\n\033[K{line3}\n")
+            out.flush()
+        else:  # single-line carriage-return fallback
+            text = (f"[{bar}] {fraction * 100:5.1f}%{mark} {written:,}/{self.total_estimate:,} "
+                    f"ETA {fmt_duration(eta)}{mark} {rate:,.0f}/s {writer.current_path.name}")
+            width = shutil.get_terminal_size(fallback=(100, 24)).columns
+            text = text[:width - 1].ljust(width - 1)
+            self._drawn_once = True
+            sys.stderr.write("\r" + text)
+            sys.stderr.flush()
 
     def finish(self, writer: "OutputWriter") -> None:
-        if not self.enabled:
+        if self.mode == "off":
             return
         self.update(writer, force=True)
+        if self.mode == "line" and self._drawn_once:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 def generate(pieces, min_length: int, max_length: int,
