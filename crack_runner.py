@@ -21,14 +21,18 @@ Example:
 """
 
 import argparse
+import logging
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -75,7 +79,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true",
                         help="Allow reusing a --work-dir that already has files matching "
                              "the output prefix (they are deleted first)")
+    parser.add_argument("--log-file", type=Path, default=None,
+                        help="Path to the run history log file "
+                             "(default: <work-dir>/crack_runner.log)")
+    parser.add_argument("--log-level", choices=LOG_LEVELS, default="INFO",
+                        help="Verbosity of the file log (default: INFO). DEBUG additionally logs "
+                             "the exact dict_gen.py/hashcat command lines run; WARNING/ERROR only "
+                             "logs problems, dropping the step-by-step file-by-file history.")
+    parser.add_argument("--log-max-bytes", type=int, default=5 * 1024 * 1024,
+                        help="Rotate the log file after it reaches this size in bytes "
+                             "(default: 5MB); keeps the log from growing without bound on long runs")
+    parser.add_argument("--log-backups", type=int, default=3,
+                        help="Number of rotated log files to keep (default: 3)")
     return parser
+
+
+def setup_logger(log_path: Path, level: str, max_bytes: int, backups: int) -> logging.Logger:
+    """File-only run history logger: one compact line per event (config,
+    file taken/processed/deleted, crack result), rotated so it can't grow
+    without bound over a long-running session."""
+    logger = logging.getLogger("crack_runner")
+    logger.setLevel(getattr(logging, level))
+    logger.propagate = False
+    handler = RotatingFileHandler(
+        log_path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
 
 
 def resolve_dict_gen_script(explicit: Optional[Path]) -> Path:
@@ -103,13 +133,39 @@ def discover_files(work_dir: Path, prefix: str) -> Dict[int, Path]:
     return found
 
 
+def estimate_progress_total(dict_gen_script: Path, seed: Path, dictgen_extra: list,
+                             logger: logging.Logger) -> Tuple[Optional[int], bool]:
+    """Reuse dict_gen.py's own estimate_total()/load_dictionary() (loaded
+    from the resolved script path) to get the same word-count estimate it
+    shows in its own progress bar, so the file log's % matches. Returns
+    (None, False) if anything about this goes wrong -- progress logging
+    then just drops the % and works off raw counts instead."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dict_gen_for_estimate", dict_gen_script)
+        dict_gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dict_gen)
+        dg_args = dict_gen.build_arg_parser().parse_args([str(seed)] + dictgen_extra)
+        rules = dict_gen.load_dictionary(seed)
+        total = dict_gen.estimate_total(rules.pieces, dg_args.min_length, dg_args.max_length)
+        approx = dg_args.max_repeat is not None or rules.has_constraints()
+        return total, approx
+    except Exception as exc:  # noqa: BLE001 - estimation is a best-effort convenience
+        logger.warning("Could not pre-compute a progress total (%s); logging raw counts only", exc)
+        return None, False
+
+
 def start_generator(python: str, script: Path, seed: Path, work_dir: Path,
-                     prefix: str, extra_args: list, log_path: Path) -> subprocess.Popen:
+                     prefix: str, extra_args: list, log_path: Path,
+                     logger: logging.Logger) -> subprocess.Popen:
     cmd = [python, str(script), str(seed), "--out-dir", str(work_dir), "--prefix", prefix] + extra_args
     log_file = open(log_path, "w", encoding="utf-8")
     print(f"[crack_runner] Starting generator: {' '.join(cmd)}")
     print(f"[crack_runner] Generator output logged to {log_path}")
-    return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+    logger.debug("GEN CMD %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+    logger.info("GEN START pid=%s", proc.pid)
+    return proc
 
 
 def resolve_hashcat(hashcat_bin: str, explicit_cwd: Optional[Path]) -> Tuple[str, Optional[Path]]:
@@ -147,17 +203,19 @@ def resolve_hashcat(hashcat_bin: str, explicit_cwd: Optional[Path]) -> Tuple[str
 
 
 def run_hashcat_attack(hashcat_exe: str, hashcat_cwd: Optional[Path], hash_type: int,
-                        target: str, dict_path: Path, extra_args: list) -> int:
+                        target: str, dict_path: Path, extra_args: list,
+                        logger: logging.Logger) -> int:
     cmd = [hashcat_exe, "-a", "0", "-m", str(hash_type),
            str(Path(target).resolve()) if Path(target).exists() else target,
            str(dict_path.resolve())] + extra_args
     print(f"[crack_runner] Running: {' '.join(cmd)}" + (f"  (cwd={hashcat_cwd})" if hashcat_cwd else ""))
+    logger.debug("HASHCAT CMD %s", " ".join(cmd))
     result = subprocess.run(cmd, cwd=hashcat_cwd)
     return result.returncode
 
 
 def check_cracked(hashcat_exe: str, hashcat_cwd: Optional[Path], hash_type: int,
-                   target: str) -> Optional[str]:
+                   target: str, logger: logging.Logger) -> Optional[str]:
     """Ask hashcat what it has already cracked (via the potfile) for this
     target. Returns the raw --show output (one or more 'hash:...:plain'
     lines) if something is cracked, else None. Using --show instead of
@@ -165,6 +223,7 @@ def check_cracked(hashcat_exe: str, hashcat_cwd: Optional[Path], hash_type: int,
     versions and across resumed/aborted runs."""
     resolved_target = str(Path(target).resolve()) if Path(target).exists() else target
     cmd = [hashcat_exe, "-m", str(hash_type), "--show", resolved_target]
+    logger.debug("SHOW CMD %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=hashcat_cwd)
     output = result.stdout.strip()
     return output if output else None
@@ -215,18 +274,36 @@ def main() -> int:
     dictgen_extra = shlex.split(args.dictgen_args)
     hashcat_extra = shlex.split(args.hashcat_args)
 
+    log_path = args.log_file or (work_dir / "crack_runner.log")
+    logger = setup_logger(log_path, args.log_level, args.log_max_bytes, args.log_backups)
+    print(f"[crack_runner] Run history logged to {log_path} (level {args.log_level})")
+    logger.info("START config=%s", vars(args))
+
     hashcat_exe, hashcat_cwd = resolve_hashcat(args.hashcat_bin, args.hashcat_cwd)
     if hashcat_cwd:
         print(f"[crack_runner] Running hashcat from {hashcat_cwd} (portable install detected)")
+        logger.info("HASHCAT CWD %s", hashcat_cwd)
+
+    total_estimate, approx = estimate_progress_total(
+        dict_gen_script, args.seed, dictgen_extra, logger)
+    if total_estimate:
+        logger.info("ESTIMATE total_words=%s approx=%s", f"{total_estimate:,}", approx)
 
     generator = start_generator(
         args.python, dict_gen_script, args.seed, work_dir, args.prefix,
-        dictgen_extra, work_dir / "dictgen.log",
+        dictgen_extra, work_dir / "dictgen.log", logger,
     )
 
     processed: set = set()
     cracked_output: Optional[str] = None
     exit_code = 1
+    cumulative_words = 0
+
+    def progress_suffix() -> str:
+        if not total_estimate:
+            return ""
+        pct = min(cumulative_words / total_estimate * 100, 100.0)
+        return f" cumulative={cumulative_words:,}/{total_estimate:,} ({pct:.1f}%{'~' if approx else ''})"
 
     try:
         while True:
@@ -242,23 +319,33 @@ def main() -> int:
                 path = files[i]
                 word_count = sum(1 for _ in open(path, "r", encoding="utf-8", errors="replace"))
                 print(f"[crack_runner] --- {path.name} ({word_count:,} words) ---")
+                logger.info("FILE TAKEN %s words=%d", path.name, word_count)
 
                 rc = run_hashcat_attack(
-                    hashcat_exe, hashcat_cwd, args.hash_type, args.target, path, hashcat_extra)
+                    hashcat_exe, hashcat_cwd, args.hash_type, args.target, path,
+                    hashcat_extra, logger)
                 if rc not in (0, 1):
-                    print(
-                        f"[crack_runner] hashcat exited with unexpected status {rc} on "
-                        f"{path.name} -- stopping (this usually means a configuration error, "
-                        f"not just 'not found in this file').",
-                        file=sys.stderr,
-                    )
+                    msg = (f"hashcat exited with unexpected status {rc} on {path.name} -- "
+                           f"stopping (this usually means a configuration error, not just "
+                           f"'not found in this file').")
+                    print(f"[crack_runner] {msg}", file=sys.stderr)
+                    logger.error("HASHCAT ERROR %s rc=%d", path.name, rc)
                     terminate(generator)
+                    logger.info("GEN STOP reason=hashcat_error")
                     return 1
 
                 processed.add(i)
-                cracked_output = check_cracked(hashcat_exe, hashcat_cwd, args.hash_type, args.target)
+                cumulative_words += word_count
+                cracked_output = check_cracked(
+                    hashcat_exe, hashcat_cwd, args.hash_type, args.target, logger)
+                logger.info(
+                    "FILE DONE %s words=%d rc=%d cracked=%s%s",
+                    path.name, word_count, rc, bool(cracked_output), progress_suffix(),
+                )
+
                 if not args.keep_dictionaries:
                     path.unlink(missing_ok=True)
+                    logger.info("FILE DELETED %s", path.name)
 
                 if cracked_output:
                     break
@@ -273,21 +360,28 @@ def main() -> int:
             time.sleep(args.poll_interval)
     except KeyboardInterrupt:
         print("\n[crack_runner] Interrupted, stopping...", file=sys.stderr)
+        logger.warning("INTERRUPTED by user after %d file(s)%s", len(processed), progress_suffix())
         exit_code = 130
     finally:
         terminate(generator)
+        logger.info("GEN STOP")
 
     if cracked_output:
         print("\n[crack_runner] CRACKED:")
         print(cracked_output)
+        logger.info("CRACKED %s", cracked_output.replace("\n", " | "))
         if not args.keep_dictionaries:
             # The generator may have produced further files in the background
             # while the last hashcat run was in progress; they were never
             # tried, so there's no reason to leave them on disk.
-            for path in discover_files(work_dir, args.prefix).values():
+            leftovers = discover_files(work_dir, args.prefix)
+            for path in leftovers.values():
                 path.unlink(missing_ok=True)
+            if leftovers:
+                logger.info("FILES DELETED (unprocessed leftovers) count=%d", len(leftovers))
     elif exit_code == 1:
         print("\n[crack_runner] Exhausted all generated dictionaries without cracking the hash.")
+        logger.info("EXHAUSTED files=%d%s", len(processed), progress_suffix())
 
     return exit_code
 
