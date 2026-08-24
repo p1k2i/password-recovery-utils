@@ -23,11 +23,12 @@ Example:
 import argparse
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -53,6 +54,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Python executable used to run dict_gen.py (default: current interpreter)")
     parser.add_argument("--hashcat-bin", default="hashcat",
                         help="hashcat executable (default: 'hashcat')")
+    parser.add_argument("--hashcat-cwd", type=Path, default=None,
+                        help="Directory to run hashcat from. hashcat looks up ./OpenCL and "
+                             "./modules relative to its *working directory*, not its executable's "
+                             "location, so a portable install fails with e.g. './OpenCL/: No such "
+                             "file or directory' if launched from elsewhere. Default: auto-detected "
+                             "as the folder containing the hashcat executable, if it looks like a "
+                             "portable install (has an OpenCL/ or modules/ subfolder there).")
     parser.add_argument("--dictgen-args", default="",
                         help="Extra arguments passed through to dict_gen.py, quoted as one string, "
                              "e.g. \"--min-length 4 --max-length 10 --max-repeat 2\"")
@@ -104,22 +112,60 @@ def start_generator(python: str, script: Path, seed: Path, work_dir: Path,
     return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
 
 
-def run_hashcat_attack(hashcat_bin: str, hash_type: int, target: str,
-                        dict_path: Path, extra_args: list) -> int:
-    cmd = [hashcat_bin, "-a", "0", "-m", str(hash_type), target, str(dict_path)] + extra_args
-    print(f"[crack_runner] Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
+def resolve_hashcat(hashcat_bin: str, explicit_cwd: Optional[Path]) -> Tuple[str, Optional[Path]]:
+    """Figure out the absolute hashcat executable path and, unless the
+    caller pinned one, the directory to run it from.
+
+    hashcat resolves ./OpenCL, ./modules, ./kernels etc. relative to its
+    *current working directory* at launch, not relative to the executable
+    itself. Portable hashcat distributions (the common case on Windows,
+    and plenty of manual Linux installs) rely on always being launched
+    from their own install folder; run them from anywhere else and they
+    fail with e.g. "./OpenCL/: No such file or directory". We avoid that
+    by locating the executable, and if its folder looks like such an
+    install (it contains OpenCL/ or modules/), using that folder as the
+    subprocess cwd -- with the executable and every path passed to it
+    made absolute first, so it doesn't matter that we're no longer
+    launching from the caller's own working directory."""
+    if explicit_cwd is not None:
+        which_result = shutil.which(hashcat_bin)
+        exe = Path(which_result) if which_result else Path(hashcat_bin)
+        return str(exe.resolve() if exe.exists() else exe), explicit_cwd
+
+    which_result = shutil.which(hashcat_bin)
+    exe_path = Path(which_result) if which_result else Path(hashcat_bin)
+    if not exe_path.is_file():
+        # Not found as a real file (e.g. relies on shell/PATH lookup we
+        # can't resolve) -- leave it alone, same as before this fix.
+        return hashcat_bin, None
+
+    exe_path = exe_path.resolve()
+    install_dir = exe_path.parent
+    if (install_dir / "OpenCL").is_dir() or (install_dir / "modules").is_dir():
+        return str(exe_path), install_dir
+    return str(exe_path), None
+
+
+def run_hashcat_attack(hashcat_exe: str, hashcat_cwd: Optional[Path], hash_type: int,
+                        target: str, dict_path: Path, extra_args: list) -> int:
+    cmd = [hashcat_exe, "-a", "0", "-m", str(hash_type),
+           str(Path(target).resolve()) if Path(target).exists() else target,
+           str(dict_path.resolve())] + extra_args
+    print(f"[crack_runner] Running: {' '.join(cmd)}" + (f"  (cwd={hashcat_cwd})" if hashcat_cwd else ""))
+    result = subprocess.run(cmd, cwd=hashcat_cwd)
     return result.returncode
 
 
-def check_cracked(hashcat_bin: str, hash_type: int, target: str) -> Optional[str]:
+def check_cracked(hashcat_exe: str, hashcat_cwd: Optional[Path], hash_type: int,
+                   target: str) -> Optional[str]:
     """Ask hashcat what it has already cracked (via the potfile) for this
     target. Returns the raw --show output (one or more 'hash:...:plain'
     lines) if something is cracked, else None. Using --show instead of
     trusting the attack's own exit code makes this robust across hashcat
     versions and across resumed/aborted runs."""
-    cmd = [hashcat_bin, "-m", str(hash_type), "--show", target]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    resolved_target = str(Path(target).resolve()) if Path(target).exists() else target
+    cmd = [hashcat_exe, "-m", str(hash_type), "--show", resolved_target]
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=hashcat_cwd)
     output = result.stdout.strip()
     return output if output else None
 
@@ -169,6 +215,10 @@ def main() -> int:
     dictgen_extra = shlex.split(args.dictgen_args)
     hashcat_extra = shlex.split(args.hashcat_args)
 
+    hashcat_exe, hashcat_cwd = resolve_hashcat(args.hashcat_bin, args.hashcat_cwd)
+    if hashcat_cwd:
+        print(f"[crack_runner] Running hashcat from {hashcat_cwd} (portable install detected)")
+
     generator = start_generator(
         args.python, dict_gen_script, args.seed, work_dir, args.prefix,
         dictgen_extra, work_dir / "dictgen.log",
@@ -194,7 +244,7 @@ def main() -> int:
                 print(f"[crack_runner] --- {path.name} ({word_count:,} words) ---")
 
                 rc = run_hashcat_attack(
-                    args.hashcat_bin, args.hash_type, args.target, path, hashcat_extra)
+                    hashcat_exe, hashcat_cwd, args.hash_type, args.target, path, hashcat_extra)
                 if rc not in (0, 1):
                     print(
                         f"[crack_runner] hashcat exited with unexpected status {rc} on "
@@ -206,7 +256,7 @@ def main() -> int:
                     return 1
 
                 processed.add(i)
-                cracked_output = check_cracked(args.hashcat_bin, args.hash_type, args.target)
+                cracked_output = check_cracked(hashcat_exe, hashcat_cwd, args.hash_type, args.target)
                 if not args.keep_dictionaries:
                     path.unlink(missing_ok=True)
 
