@@ -1,7 +1,7 @@
 {
   "pieces": [
     { "value": "admin", "positions": "first" },
-    "root",
+    { "value": "root", "exclude_positions": ["first", 2] },
     "2023",
     { "value": "123", "max_repeat": 2 },
     { "value": "qwerty", "repeatable": false },
