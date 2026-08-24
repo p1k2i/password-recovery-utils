@@ -27,6 +27,11 @@ per-piece rules:
       ],
       "requires": [
         {"if": "2023", "then": ["admin"]}
+      ],
+      "relations": [
+        {"pieces": ["root", "123"], "mode": "together"},
+        {"pieces": ["qwerty", "123"], "mode": "separate"},
+        {"pieces": ["admin", "2023"], "mode": "order"}
       ]
     }
 
@@ -42,6 +47,9 @@ per-piece rules:
   - "requires": each rule says that if the "if" piece appears in a word,
     every piece listed in "then" must also appear in it ("if this then
     that too"). "then" may be a single string or a list.
+  - "relations": each rule constrains how 2+ specific pieces sit relative
+    to *each other*, whenever at least two of them appear in the same
+    word (see below).
 
   "positions" restricts where a piece may sit in the sequence of pieces
   that makes up a word (1-based slot counting, not character index).
@@ -56,6 +64,28 @@ per-piece rules:
   a word can end at many different lengths -- e.g. a piece restricted to
   "last" is only allowed to close a word out, never to be followed by
   another piece.
+
+  "relations" rules each have a "pieces" list (2 or more piece values)
+  and a "mode":
+      "together"  -> whenever 2+ of them appear, they must all sit in one
+                      contiguous block (no other piece wedged between
+                      them) -- their own relative order among each other
+                      is free unless also constrained by an "order" rule
+      "separate"  -> whenever 2+ of them appear, no two of them may sit
+                      in adjacent slots
+      "order"     -> whenever 2+ of them appear, every occurrence of an
+                      earlier piece in the "pieces" list must come before
+                      every occurrence of a later one ("this piece, then
+                      that piece" -- not necessarily adjacent)
+      "any"       -> explicitly unrestricted (a no-op; only useful for
+                      documenting intent)
+  Rules only bite once at least two of their listed pieces are actually
+  present in a word -- a rule about A and B has no effect on a word that
+  only contains A. Multiple rules can target the same pieces to combine
+  effects (e.g. "together" + "order" on the same pair forces them to
+  appear as one block in that exact order). "together" and "separate"
+  can't both be declared for the exact identical set of pieces, since no
+  word could ever satisfy both.
 
 Example:
     python dict_gen.py seed.txt --min-length 4 --max-length 8 \
@@ -102,27 +132,44 @@ def parse_size(value: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid size value: {value!r}")
 
 
+class PieceRelation:
+    """One 'relations' rule: how 2+ specific pieces must sit relative to
+    each other (whenever at least two of them appear in the same word).
+    mode is one of 'together', 'separate', 'order' ('any' rules are
+    dropped at load time since they don't constrain anything)."""
+
+    __slots__ = ("pieces", "mode")
+
+    def __init__(self, pieces: List[str], mode: str):
+        self.pieces = pieces
+        self.mode = mode
+
+
 class PieceRules:
     """Pieces plus the per-piece usage rules that constrain how they may
     be combined: an optional repeat-count override, mutual-exclusion
     groups, "if this piece is used, that piece must be used too"
-    requirements, and a restriction on which slot(s) a piece may occupy
-    within the sequence of pieces that makes up a word."""
+    requirements, a restriction on which slot(s) a piece may occupy
+    within the sequence of pieces that makes up a word, and relative
+    placement rules between specific pieces (together/separate/order)."""
 
     def __init__(self, pieces: List[str],
                  max_repeat_overrides: Dict[str, int],
                  exclusive_of: Dict[str, Set[str]],
                  requires: Dict[str, Set[str]],
-                 position_rules: Dict[str, PositionSpec]):
+                 position_rules: Dict[str, PositionSpec],
+                 relations: List[PieceRelation]):
         self.pieces = pieces
         self.max_repeat_overrides = max_repeat_overrides
         self.exclusive_of = exclusive_of
         self.requires = requires
         self.position_rules = position_rules
+        self.relations = relations
 
     def has_constraints(self) -> bool:
         return (bool(self.max_repeat_overrides) or any(self.exclusive_of.values())
-                or any(self.requires.values()) or bool(self.position_rules))
+                or any(self.requires.values()) or bool(self.position_rules)
+                or bool(self.relations))
 
 
 def load_pieces_txt(path: Path) -> PieceRules:
@@ -139,10 +186,11 @@ def load_pieces_txt(path: Path) -> PieceRules:
             pieces.append(piece)
     if not pieces:
         raise ValueError(f"No usable pieces found in dictionary file: {path}")
-    return PieceRules(pieces, {}, {p: set() for p in pieces}, {p: set() for p in pieces}, {})
+    return PieceRules(pieces, {}, {p: set() for p in pieces}, {p: set() for p in pieces}, {}, [])
 
 
 POSITION_KEYWORDS = ("first", "last", "middle", "any")
+RELATION_MODES = ("together", "separate", "order", "any")
 
 
 def parse_positions(value, piece_label: str) -> Optional[PositionSpec]:
@@ -287,7 +335,40 @@ def load_pieces_json(path: Path) -> PieceRules:
                 f"exclusive with {sorted(conflict)} -- no word could ever satisfy both rules"
             )
 
-    return PieceRules(pieces, max_repeat_overrides, exclusive_of, requires, position_rules)
+    relations: List[PieceRelation] = []
+    seen_modes_by_set: Dict[frozenset, Set[str]] = {}
+    for ri, rule in enumerate(data.get("relations", [])):
+        if not isinstance(rule, dict) or "pieces" not in rule or "mode" not in rule:
+            raise ValueError(f"relations[{ri}]: must be an object with 'pieces' and 'mode'")
+        rel_pieces = rule["pieces"]
+        mode = rule["mode"]
+        unknown_keys = set(rule) - {"pieces", "mode"}
+        if unknown_keys:
+            raise ValueError(f"relations[{ri}]: unknown key(s) {sorted(unknown_keys)}")
+        if not isinstance(rel_pieces, list) or len(rel_pieces) < 2:
+            raise ValueError(f"relations[{ri}]: 'pieces' must be a list of 2 or more piece values")
+        if len(set(rel_pieces)) != len(rel_pieces):
+            raise ValueError(f"relations[{ri}]: 'pieces' contains a duplicate piece value")
+        for v in rel_pieces:
+            if v not in known:
+                raise ValueError(f"relations[{ri}]: unknown piece {v!r}")
+        if mode not in RELATION_MODES:
+            raise ValueError(f"relations[{ri}]: unknown mode {mode!r} (expected one of {RELATION_MODES})")
+
+        if mode == "any":
+            continue  # explicit no-op
+
+        rel_set = frozenset(rel_pieces)
+        modes_here = seen_modes_by_set.setdefault(rel_set, set())
+        modes_here.add(mode)
+        if {"together", "separate"} <= modes_here:
+            raise ValueError(
+                f"relations[{ri}]: contradictory rules for {sorted(rel_pieces)} -- 'together' "
+                f"and 'separate' can't both apply to the exact same set of pieces"
+            )
+        relations.append(PieceRelation(list(rel_pieces), mode))
+
+    return PieceRules(pieces, max_repeat_overrides, exclusive_of, requires, position_rules, relations)
 
 
 def load_dictionary(path: Path) -> PieceRules:
@@ -513,16 +594,31 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
     """DFS over sequences of pieces (repetition allowed, subject to each
     piece's rules). Every intermediate concatenation whose length is
     within [min_length, max_length], whose used pieces satisfy all
-    "requires" rules, and whose pieces sit in slots their "positions"
-    rule allows for that word's own length, is written out as a
-    candidate password. Recursion always terminates because every piece
-    has length >= 1, so the current length strictly grows with each
-    appended piece."""
+    "requires" rules, whose pieces sit in slots their "positions" rule
+    allows for that word's own length, and whose "relations" rules (how
+    specific pieces sit relative to each other) all hold, is written out
+    as a candidate password. Recursion always terminates because every
+    piece has length >= 1, so the current length strictly grows with
+    each appended piece."""
 
     pieces = rules.pieces
     min_piece_len = min(len(p) for p in pieces)
     usage_counts: Dict[str, int] = {}
     sequence: List[str] = []
+
+    # Pieces that must never be immediate neighbors ("separate" relations).
+    # Adjacency is a fixed, local fact that can't be undone by later
+    # pieces, so it's cheaper and just as correct to reject it the moment
+    # it would happen rather than deferring to the emission-time check
+    # below (unlike "together"/"order", which genuinely depend on pieces
+    # that may still be added).
+    separate_partners: Dict[str, Set[str]] = {}
+    together_or_order = [rel for rel in rules.relations if rel.mode != "separate"]
+    for rel in rules.relations:
+        if rel.mode == "separate":
+            rel_set = set(rel.pieces)
+            for p in rel_set:
+                separate_partners.setdefault(p, set()).update(rel_set - {p})
 
     def repeat_limit(piece: str) -> Optional[int]:
         return rules.max_repeat_overrides.get(piece, global_max_repeat)
@@ -544,6 +640,26 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
                 return False
         return True
 
+    def relations_satisfied() -> bool:
+        if not together_or_order:
+            return True
+        positions_by_piece: Dict[str, List[int]] = {}
+        for idx, p in enumerate(sequence):
+            positions_by_piece.setdefault(p, []).append(idx)
+        for rel in together_or_order:
+            present = [p for p in rel.pieces if p in positions_by_piece]
+            if len(present) < 2:
+                continue
+            if rel.mode == "together":
+                all_idx = sorted(i for p in present for i in positions_by_piece[p])
+                if all_idx[-1] - all_idx[0] + 1 != len(all_idx):
+                    return False
+            elif rel.mode == "order":
+                for a, b in zip(present, present[1:]):
+                    if max(positions_by_piece[a]) >= min(positions_by_piece[b]):
+                        return False
+        return True
+
     def can_place_at(piece: str, index0: int) -> bool:
         """Cheap early rejection for slot assignments a piece's position
         rule can never satisfy, regardless of how the word continues
@@ -557,7 +673,8 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
 
     def recurse(current: str, current_len: int) -> None:
         if (current and min_length <= current_len <= max_length
-                and requirements_satisfied() and positions_satisfied()):
+                and requirements_satisfied() and positions_satisfied()
+                and relations_satisfied()):
             writer.write(current)
             progress.update(writer)
         if current_len + min_piece_len > max_length:
@@ -570,6 +687,8 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
             if any(usage_counts.get(other, 0) > 0 for other in rules.exclusive_of.get(piece, ())):
                 continue
             if not can_place_at(piece, next_index0):
+                continue
+            if sequence and piece in separate_partners.get(sequence[-1], ()):
                 continue
             usage_counts[piece] = usage_counts.get(piece, 0) + 1
             sequence.append(piece)

@@ -14,5 +14,10 @@
   ],
   "requires": [
     { "if": "2023", "then": ["admin"] }
+  ],
+  "relations": [
+    { "pieces": ["root", "123"], "mode": "together" },
+    { "pieces": ["qwerty", "123"], "mode": "separate" },
+    { "pieces": ["admin", "2023"], "mode": "order" }
   ]
 }
