@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    "admin",
+    "root",
+    "2023",
+    { "value": "123", "max_repeat": 2 },
+    { "value": "qwerty", "repeatable": false },
+    { "value": "!" },
+    { "value": "@" },
+    { "value": "#" }
+  ],
+  "exclusive_groups": [
+    ["!", "@", "#"]
+  ],
+  "requires": [
+    { "if": "2023", "then": ["admin"] }
+  ]
+}

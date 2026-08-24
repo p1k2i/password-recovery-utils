@@ -9,9 +9,40 @@ min/max length. Every valid combination is written to disk; output is
 split across multiple files (<prefix>-1.txt, <prefix>-2.txt, ...)
 according to --split-size and/or --split-count.
 
+The seed dictionary can be a plain text file (one piece per line) or a
+JSON file (detected by the .json extension) that additionally defines
+per-piece rules:
+
+    {
+      "pieces": [
+        "admin",
+        {"value": "2023", "requires": "admin"},
+        {"value": "root", "repeatable": false},
+        {"value": "!"}, {"value": "@"}, {"value": "#"}
+      ],
+      "exclusive_groups": [
+        ["!", "@", "#"]
+      ],
+      "requires": [
+        {"if": "2023", "then": ["admin"]}
+      ]
+    }
+
+  - A piece can be a bare string, or an object with "value" plus rules:
+      "repeatable": false   -> the piece may be used at most once per word
+      "max_repeat": N       -> the piece may be used at most N times per word
+                                (overrides the global --max-repeat for this piece)
+  - "exclusive_groups": each group lists pieces that are mutually
+    exclusive -- at most one piece per group may appear in a word
+    ("or this or that").
+  - "requires": each rule says that if the "if" piece appears in a word,
+    every piece listed in "then" must also appear in it ("if this then
+    that too"). "then" may be a single string or a list.
+
 Example:
     python dict_gen.py seed.txt --min-length 4 --max-length 8 \
         --prefix out --split-count 1000000 --max-repeat 3
+    python dict_gen.py seed.json --min-length 4 --max-length 12 --prefix out
 
 WARNING: the number of combinations grows combinatorially with
 --max-length and the number of pieces. Choose --max-length and
@@ -19,12 +50,13 @@ WARNING: the number of combinations grows combinatorially with
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
 
 def parse_size(value: str) -> int:
@@ -50,9 +82,28 @@ def parse_size(value: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid size value: {value!r}")
 
 
-def load_pieces(path: Path) -> list:
-    """Load unique, non-empty pieces from the seed dictionary file,
-    preserving their original order."""
+class PieceRules:
+    """Pieces plus the per-piece usage rules that constrain how they may
+    be combined: an optional repeat-count override, mutual-exclusion
+    groups, and "if this piece is used, that piece must be used too"
+    requirements."""
+
+    def __init__(self, pieces: List[str],
+                 max_repeat_overrides: Dict[str, int],
+                 exclusive_of: Dict[str, Set[str]],
+                 requires: Dict[str, Set[str]]):
+        self.pieces = pieces
+        self.max_repeat_overrides = max_repeat_overrides
+        self.exclusive_of = exclusive_of
+        self.requires = requires
+
+    def has_constraints(self) -> bool:
+        return bool(self.max_repeat_overrides) or any(self.exclusive_of.values()) or any(self.requires.values())
+
+
+def load_pieces_txt(path: Path) -> PieceRules:
+    """Load unique, non-empty pieces from a plain-text dictionary file
+    (one piece per line, no per-piece rules), preserving order."""
     pieces = []
     seen = set()
     with open(path, "r", encoding="utf-8") as f:
@@ -64,7 +115,111 @@ def load_pieces(path: Path) -> list:
             pieces.append(piece)
     if not pieces:
         raise ValueError(f"No usable pieces found in dictionary file: {path}")
-    return pieces
+    return PieceRules(pieces, {}, {p: set() for p in pieces}, {p: set() for p in pieces})
+
+
+def load_pieces_json(path: Path) -> PieceRules:
+    """Load pieces and their usage rules from a JSON dictionary file.
+    See the module docstring for the schema."""
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("pieces"), list):
+        raise ValueError(f"{path}: top-level JSON must be an object with a 'pieces' array")
+
+    pieces: List[str] = []
+    seen: Set[str] = set()
+    max_repeat_overrides: Dict[str, int] = {}
+
+    for i, item in enumerate(data["pieces"]):
+        if isinstance(item, str):
+            value, repeatable, max_repeat = item, None, None
+        elif isinstance(item, dict):
+            value = item.get("value")
+            if not isinstance(value, str) or value == "":
+                raise ValueError(f"pieces[{i}]: 'value' must be a non-empty string")
+            repeatable = item.get("repeatable")
+            max_repeat = item.get("max_repeat")
+            unknown = set(item) - {"value", "repeatable", "max_repeat"}
+            if unknown:
+                raise ValueError(f"pieces[{i}] ({value!r}): unknown key(s) {sorted(unknown)}")
+        else:
+            raise ValueError(f"pieces[{i}]: must be a string or an object with a 'value' key")
+
+        if value == "":
+            raise ValueError(f"pieces[{i}]: empty piece value is not allowed")
+        if value in seen:
+            raise ValueError(f"Duplicate piece value: {value!r}")
+        seen.add(value)
+        pieces.append(value)
+
+        if repeatable is not None and max_repeat is not None:
+            raise ValueError(f"piece {value!r}: specify either 'repeatable' or 'max_repeat', not both")
+        if repeatable is False:
+            max_repeat_overrides[value] = 1
+        elif repeatable not in (None, True):
+            raise ValueError(f"piece {value!r}: 'repeatable' must be true or false")
+        elif max_repeat is not None:
+            if not isinstance(max_repeat, int) or isinstance(max_repeat, bool) or max_repeat <= 0:
+                raise ValueError(f"piece {value!r}: 'max_repeat' must be a positive integer")
+            max_repeat_overrides[value] = max_repeat
+
+    if not pieces:
+        raise ValueError(f"No pieces defined in {path}")
+
+    known = set(pieces)
+    exclusive_of: Dict[str, Set[str]] = {p: set() for p in pieces}
+    for gi, group in enumerate(data.get("exclusive_groups", [])):
+        if not isinstance(group, list) or len(group) < 2:
+            raise ValueError(f"exclusive_groups[{gi}]: must be a list of 2 or more piece values")
+        group_set = set()
+        for v in group:
+            if v not in known:
+                raise ValueError(f"exclusive_groups[{gi}]: unknown piece {v!r}")
+            group_set.add(v)
+        for v in group_set:
+            exclusive_of[v] |= (group_set - {v})
+
+    requires: Dict[str, Set[str]] = {p: set() for p in pieces}
+    for ri, rule in enumerate(data.get("requires", [])):
+        if not isinstance(rule, dict) or "if" not in rule or "then" not in rule:
+            raise ValueError(f"requires[{ri}]: must be an object with 'if' and 'then'")
+        trigger = rule["if"]
+        then = rule["then"]
+        if isinstance(then, str):
+            then = [then]
+        if trigger not in known:
+            raise ValueError(f"requires[{ri}]: unknown piece {trigger!r} in 'if'")
+        if not isinstance(then, list) or not then:
+            raise ValueError(f"requires[{ri}]: 'then' must be a non-empty string or list of strings")
+        for t in then:
+            if t not in known:
+                raise ValueError(f"requires[{ri}]: unknown piece {t!r} in 'then'")
+            if t == trigger:
+                raise ValueError(f"requires[{ri}]: piece {trigger!r} cannot require itself")
+            requires[trigger].add(t)
+
+    for p in pieces:
+        conflict = requires[p] & exclusive_of[p]
+        if conflict:
+            raise ValueError(
+                f"Contradictory rules: {p!r} requires {sorted(conflict)} but is also mutually "
+                f"exclusive with {sorted(conflict)} -- no word could ever satisfy both rules"
+            )
+
+    return PieceRules(pieces, max_repeat_overrides, exclusive_of, requires)
+
+
+def load_dictionary(path: Path) -> PieceRules:
+    """Load the seed dictionary, dispatching on file extension: '.json'
+    files use the rule-aware JSON schema, anything else is treated as a
+    plain one-piece-per-line text file."""
+    if path.suffix.lower() == ".json":
+        return load_pieces_json(path)
+    return load_pieces_txt(path)
 
 
 class OutputWriter:
@@ -248,34 +403,47 @@ class ProgressReporter:
             sys.stderr.flush()
 
 
-def generate(pieces, min_length: int, max_length: int,
-             max_repeat: Optional[int], writer: OutputWriter,
+def generate(rules: PieceRules, min_length: int, max_length: int,
+             global_max_repeat: Optional[int], writer: OutputWriter,
              progress: "ProgressReporter") -> None:
-    """DFS over sequences of pieces (repetition allowed). Every
-    intermediate concatenation whose length is within
-    [min_length, max_length] is written out as a candidate password.
-    Recursion always terminates because every piece has length >= 1,
-    so the current length strictly grows with each appended piece."""
+    """DFS over sequences of pieces (repetition allowed, subject to each
+    piece's rules). Every intermediate concatenation whose length is
+    within [min_length, max_length] and whose used pieces satisfy all
+    "requires" rules is written out as a candidate password. Recursion
+    always terminates because every piece has length >= 1, so the
+    current length strictly grows with each appended piece."""
 
+    pieces = rules.pieces
     min_piece_len = min(len(p) for p in pieces)
-    usage_counts = {}
+    usage_counts: Dict[str, int] = {}
+
+    def repeat_limit(piece: str) -> Optional[int]:
+        return rules.max_repeat_overrides.get(piece, global_max_repeat)
+
+    def requirements_satisfied() -> bool:
+        for used_piece in usage_counts:
+            for required in rules.requires.get(used_piece, ()):
+                if usage_counts.get(required, 0) <= 0:
+                    return False
+        return True
 
     def recurse(current: str, current_len: int) -> None:
-        if current and min_length <= current_len <= max_length:
+        if current and min_length <= current_len <= max_length and requirements_satisfied():
             writer.write(current)
             progress.update(writer)
         if current_len + min_piece_len > max_length:
             return
         for piece in pieces:
-            if max_repeat is not None:
-                if usage_counts.get(piece, 0) >= max_repeat:
-                    continue
-                usage_counts[piece] = usage_counts.get(piece, 0) + 1
+            limit = repeat_limit(piece)
+            if limit is not None and usage_counts.get(piece, 0) >= limit:
+                continue
+            if any(usage_counts.get(other, 0) > 0 for other in rules.exclusive_of.get(piece, ())):
+                continue
+            usage_counts[piece] = usage_counts.get(piece, 0) + 1
             recurse(current + piece, current_len + len(piece))
-            if max_repeat is not None:
-                usage_counts[piece] -= 1
-                if usage_counts[piece] == 0:
-                    del usage_counts[piece]
+            usage_counts[piece] -= 1
+            if usage_counts[piece] == 0:
+                del usage_counts[piece]
 
     recurse("", 0)
 
@@ -287,7 +455,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "dictionary", type=Path,
-        help="Path to the seed dictionary file (one piece per line)")
+        help="Path to the seed dictionary: a .txt file (one piece per line) "
+             "or a .json file with per-piece rules (see module docstring)")
     parser.add_argument(
         "--min-length", type=int, default=0,
         help="Minimum output word length (default: 0)")
@@ -331,20 +500,20 @@ def main() -> None:
         parser.error("--max-repeat must be > 0")
 
     try:
-        pieces = load_pieces(args.dictionary)
+        rules = load_dictionary(args.dictionary)
     except (OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    total_estimate = estimate_total(pieces, args.min_length, args.max_length)
-    progress = ProgressReporter(
-        total_estimate, approx=args.max_repeat is not None, enabled=not args.quiet)
+    total_estimate = estimate_total(rules.pieces, args.min_length, args.max_length)
+    approx = args.max_repeat is not None or rules.has_constraints()
+    progress = ProgressReporter(total_estimate, approx=approx, enabled=not args.quiet)
 
     writer = OutputWriter(args.out_dir, args.prefix, args.split_size, args.split_count)
     try:
-        generate(pieces, args.min_length, args.max_length, args.max_repeat, writer, progress)
+        generate(rules, args.min_length, args.max_length, args.max_repeat, writer, progress)
     finally:
         progress.finish(writer)
         writer.close()
