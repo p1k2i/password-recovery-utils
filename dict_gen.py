@@ -15,10 +15,12 @@ per-piece rules:
 
     {
       "pieces": [
-        "admin",
+        {"value": "admin", "positions": "first"},
         {"value": "2023", "requires": "admin"},
         {"value": "root", "repeatable": false},
-        {"value": "!"}, {"value": "@"}, {"value": "#"}
+        {"value": "!", "positions": "last"},
+        {"value": "@", "positions": "last"},
+        {"value": "#", "positions": ["first", 3]}
       ],
       "exclusive_groups": [
         ["!", "@", "#"]
@@ -32,12 +34,28 @@ per-piece rules:
       "repeatable": false   -> the piece may be used at most once per word
       "max_repeat": N       -> the piece may be used at most N times per word
                                 (overrides the global --max-repeat for this piece)
+      "positions": ...      -> restricts which slot(s) in the piece sequence
+                                this piece may occupy (see below)
   - "exclusive_groups": each group lists pieces that are mutually
     exclusive -- at most one piece per group may appear in a word
     ("or this or that").
   - "requires": each rule says that if the "if" piece appears in a word,
     every piece listed in "then" must also appear in it ("if this then
     that too"). "then" may be a single string or a list.
+
+  "positions" restricts where a piece may sit in the sequence of pieces
+  that makes up a word (1-based slot counting, not character index).
+  Accepts a single value or a list of alternatives (any one matching is
+  enough):
+      1, 2, 3, ...  -> that exact slot ("1st and 3rd" -> [1, 3])
+      "first"       -> same as 1
+      "last"        -> the final piece in the word
+      "middle"      -> any slot that is neither first nor last
+      "any"         -> unrestricted (the default when "positions" is omitted)
+  "last" and "middle" are evaluated against each word's own length, since
+  a word can end at many different lengths -- e.g. a piece restricted to
+  "last" is only allowed to close a word out, never to be followed by
+  another piece.
 
 Example:
     python dict_gen.py seed.txt --min-length 4 --max-length 8 \
@@ -56,7 +74,9 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
+
+PositionSpec = List[Union[int, str]]
 
 
 def parse_size(value: str) -> int:
@@ -85,20 +105,24 @@ def parse_size(value: str) -> int:
 class PieceRules:
     """Pieces plus the per-piece usage rules that constrain how they may
     be combined: an optional repeat-count override, mutual-exclusion
-    groups, and "if this piece is used, that piece must be used too"
-    requirements."""
+    groups, "if this piece is used, that piece must be used too"
+    requirements, and a restriction on which slot(s) a piece may occupy
+    within the sequence of pieces that makes up a word."""
 
     def __init__(self, pieces: List[str],
                  max_repeat_overrides: Dict[str, int],
                  exclusive_of: Dict[str, Set[str]],
-                 requires: Dict[str, Set[str]]):
+                 requires: Dict[str, Set[str]],
+                 position_rules: Dict[str, PositionSpec]):
         self.pieces = pieces
         self.max_repeat_overrides = max_repeat_overrides
         self.exclusive_of = exclusive_of
         self.requires = requires
+        self.position_rules = position_rules
 
     def has_constraints(self) -> bool:
-        return bool(self.max_repeat_overrides) or any(self.exclusive_of.values()) or any(self.requires.values())
+        return (bool(self.max_repeat_overrides) or any(self.exclusive_of.values())
+                or any(self.requires.values()) or bool(self.position_rules))
 
 
 def load_pieces_txt(path: Path) -> PieceRules:
@@ -115,7 +139,54 @@ def load_pieces_txt(path: Path) -> PieceRules:
             pieces.append(piece)
     if not pieces:
         raise ValueError(f"No usable pieces found in dictionary file: {path}")
-    return PieceRules(pieces, {}, {p: set() for p in pieces}, {p: set() for p in pieces})
+    return PieceRules(pieces, {}, {p: set() for p in pieces}, {p: set() for p in pieces}, {})
+
+
+POSITION_KEYWORDS = ("first", "last", "middle", "any")
+
+
+def parse_positions(value, piece_label: str) -> Optional[PositionSpec]:
+    """Normalize a piece's 'positions' field into a list of tokens (ints
+    and/or the keywords "first"/"last"/"middle"), or None for
+    unrestricted. Accepts a single string/int or a list of them."""
+    if value is None:
+        return None
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        value = [value]
+    if not isinstance(value, list) or not value:
+        raise ValueError(
+            f"piece {piece_label!r}: 'positions' must be an integer, one of "
+            f"{POSITION_KEYWORDS}, or a non-empty list of these"
+        )
+
+    normalized: PositionSpec = []
+    for token in value:
+        if isinstance(token, bool) or not isinstance(token, (int, str)):
+            raise ValueError(f"piece {piece_label!r}: invalid 'positions' entry {token!r}")
+        if isinstance(token, int):
+            if token <= 0:
+                raise ValueError(
+                    f"piece {piece_label!r}: position numbers are 1-based and must be >= 1, "
+                    f"got {token}"
+                )
+            normalized.append(token)
+            continue
+        keyword = token.strip().lower()
+        if keyword not in POSITION_KEYWORDS:
+            raise ValueError(
+                f"piece {piece_label!r}: unknown position {token!r} "
+                f"(expected an integer or one of {POSITION_KEYWORDS})"
+            )
+        normalized.append(keyword)
+
+    if "any" in normalized:
+        if len(normalized) > 1:
+            raise ValueError(
+                f"piece {piece_label!r}: 'any' means unrestricted and cannot be combined "
+                f"with other position constraints"
+            )
+        return None  # "any" is the same as omitting 'positions' entirely
+    return normalized
 
 
 def load_pieces_json(path: Path) -> PieceRules:
@@ -133,17 +204,19 @@ def load_pieces_json(path: Path) -> PieceRules:
     pieces: List[str] = []
     seen: Set[str] = set()
     max_repeat_overrides: Dict[str, int] = {}
+    position_rules: Dict[str, PositionSpec] = {}
 
     for i, item in enumerate(data["pieces"]):
         if isinstance(item, str):
-            value, repeatable, max_repeat = item, None, None
+            value, repeatable, max_repeat, positions = item, None, None, None
         elif isinstance(item, dict):
             value = item.get("value")
             if not isinstance(value, str) or value == "":
                 raise ValueError(f"pieces[{i}]: 'value' must be a non-empty string")
             repeatable = item.get("repeatable")
             max_repeat = item.get("max_repeat")
-            unknown = set(item) - {"value", "repeatable", "max_repeat"}
+            positions = item.get("positions")
+            unknown = set(item) - {"value", "repeatable", "max_repeat", "positions"}
             if unknown:
                 raise ValueError(f"pieces[{i}] ({value!r}): unknown key(s) {sorted(unknown)}")
         else:
@@ -166,6 +239,10 @@ def load_pieces_json(path: Path) -> PieceRules:
             if not isinstance(max_repeat, int) or isinstance(max_repeat, bool) or max_repeat <= 0:
                 raise ValueError(f"piece {value!r}: 'max_repeat' must be a positive integer")
             max_repeat_overrides[value] = max_repeat
+
+        parsed_positions = parse_positions(positions, value)
+        if parsed_positions is not None:
+            position_rules[value] = parsed_positions
 
     if not pieces:
         raise ValueError(f"No pieces defined in {path}")
@@ -210,7 +287,7 @@ def load_pieces_json(path: Path) -> PieceRules:
                 f"exclusive with {sorted(conflict)} -- no word could ever satisfy both rules"
             )
 
-    return PieceRules(pieces, max_repeat_overrides, exclusive_of, requires)
+    return PieceRules(pieces, max_repeat_overrides, exclusive_of, requires, position_rules)
 
 
 def load_dictionary(path: Path) -> PieceRules:
@@ -403,19 +480,49 @@ class ProgressReporter:
             sys.stderr.flush()
 
 
+def _position_spec_is_static(spec: PositionSpec) -> bool:
+    """True if every token in a position spec is decidable from the
+    piece's own slot index alone (an exact slot number, or "first"),
+    with none depending on the eventual total sequence length ("last",
+    "middle")."""
+    return all(token != "last" and token != "middle" for token in spec)
+
+
+def _position_matches(spec: PositionSpec, index0: int, total: int) -> bool:
+    """Does a piece placed at 0-based `index0` within a `total`-piece
+    sequence satisfy its position spec?"""
+    for token in spec:
+        if token == "first":
+            if index0 == 0:
+                return True
+        elif token == "last":
+            if index0 == total - 1:
+                return True
+        elif token == "middle":
+            if 0 < index0 < total - 1:
+                return True
+        elif isinstance(token, int):
+            if index0 == token - 1:
+                return True
+    return False
+
+
 def generate(rules: PieceRules, min_length: int, max_length: int,
              global_max_repeat: Optional[int], writer: OutputWriter,
              progress: "ProgressReporter") -> None:
     """DFS over sequences of pieces (repetition allowed, subject to each
     piece's rules). Every intermediate concatenation whose length is
-    within [min_length, max_length] and whose used pieces satisfy all
-    "requires" rules is written out as a candidate password. Recursion
-    always terminates because every piece has length >= 1, so the
-    current length strictly grows with each appended piece."""
+    within [min_length, max_length], whose used pieces satisfy all
+    "requires" rules, and whose pieces sit in slots their "positions"
+    rule allows for that word's own length, is written out as a
+    candidate password. Recursion always terminates because every piece
+    has length >= 1, so the current length strictly grows with each
+    appended piece."""
 
     pieces = rules.pieces
     min_piece_len = min(len(p) for p in pieces)
     usage_counts: Dict[str, int] = {}
+    sequence: List[str] = []
 
     def repeat_limit(piece: str) -> Optional[int]:
         return rules.max_repeat_overrides.get(piece, global_max_repeat)
@@ -427,20 +534,47 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
                     return False
         return True
 
+    def positions_satisfied() -> bool:
+        if not rules.position_rules:
+            return True
+        total = len(sequence)
+        for index0, piece in enumerate(sequence):
+            spec = rules.position_rules.get(piece)
+            if spec is not None and not _position_matches(spec, index0, total):
+                return False
+        return True
+
+    def can_place_at(piece: str, index0: int) -> bool:
+        """Cheap early rejection for slot assignments a piece's position
+        rule can never satisfy, regardless of how the word continues
+        from here. Only applies when the rule is fully static (no
+        "last"/"middle", which depend on the word's eventual length and
+        so can only be checked once a candidate word is complete)."""
+        spec = rules.position_rules.get(piece)
+        if spec is None or not _position_spec_is_static(spec):
+            return True
+        return _position_matches(spec, index0, index0 + 1)
+
     def recurse(current: str, current_len: int) -> None:
-        if current and min_length <= current_len <= max_length and requirements_satisfied():
+        if (current and min_length <= current_len <= max_length
+                and requirements_satisfied() and positions_satisfied()):
             writer.write(current)
             progress.update(writer)
         if current_len + min_piece_len > max_length:
             return
+        next_index0 = len(sequence)
         for piece in pieces:
             limit = repeat_limit(piece)
             if limit is not None and usage_counts.get(piece, 0) >= limit:
                 continue
             if any(usage_counts.get(other, 0) > 0 for other in rules.exclusive_of.get(piece, ())):
                 continue
+            if not can_place_at(piece, next_index0):
+                continue
             usage_counts[piece] = usage_counts.get(piece, 0) + 1
+            sequence.append(piece)
             recurse(current + piece, current_len + len(piece))
+            sequence.pop()
             usage_counts[piece] -= 1
             if usage_counts[piece] == 0:
                 del usage_counts[piece]

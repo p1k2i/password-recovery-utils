@@ -1,13 +1,13 @@
 {
   "pieces": [
-    "admin",
+    { "value": "admin", "positions": "first" },
     "root",
     "2023",
     { "value": "123", "max_repeat": 2 },
     { "value": "qwerty", "repeatable": false },
-    { "value": "!" },
-    { "value": "@" },
-    { "value": "#" }
+    { "value": "!", "positions": "last" },
+    { "value": "@", "positions": "last" },
+    { "value": "#", "positions": ["first", 3] }
   ],
   "exclusive_groups": [
     ["!", "@", "#"]
