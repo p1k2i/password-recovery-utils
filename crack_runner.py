@@ -286,6 +286,33 @@ def check_cracked(hashcat_exe: str, hashcat_cwd: Optional[Path], hash_type: int,
     return output if output else None
 
 
+def safe_unlink(path: Path, logger: logging.Logger, retries: int = 5, delay: float = 0.3) -> bool:
+    """Delete `path`, retrying briefly on a transient PermissionError.
+
+    On Windows, a file that was just read (word-counted, handed to
+    hashcat) can stay momentarily locked by Defender/AV real-time
+    scanning or search indexing after the reading process has already
+    exited -- os.unlink() then raises WinError 32 ("used by another
+    process") even though nothing in this program still has it open.
+    POSIX has no such failure mode, so this simply succeeds on the
+    first try there. Returns True if the file is gone afterward, False
+    if it still couldn't be removed after `retries` attempts -- in
+    which case a warning is logged and the caller carries on rather
+    than crashing the whole run (deleting dictionaries is a
+    disk-space optimization, not something correctness depends on)."""
+    for attempt in range(1, retries + 1):
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        except PermissionError as exc:
+            if attempt == retries:
+                logger.warning(
+                    "FILE DELETE FAILED %s after %d attempt(s): %s", path.name, attempt, exc)
+                return False
+            time.sleep(delay)
+    return False
+
+
 def terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
     if proc.poll() is not None:
         return
@@ -561,8 +588,8 @@ def main() -> int:
             for i in sorted(files):
                 if i in processed and i not in skipped_cleanup:
                     if not args.keep_dictionaries:
-                        files[i].unlink(missing_ok=True)
-                        logger.info("FILE SKIPPED (already processed) %s", files[i].name)
+                        if safe_unlink(files[i], logger):
+                            logger.info("FILE SKIPPED (already processed) %s", files[i].name)
                     skipped_cleanup.add(i)
 
             if generator_done:
@@ -603,8 +630,8 @@ def main() -> int:
                 )
 
                 if not args.keep_dictionaries:
-                    path.unlink(missing_ok=True)
-                    logger.info("FILE DELETED %s", path.name)
+                    if safe_unlink(path, logger):
+                        logger.info("FILE DELETED %s", path.name)
 
                 persist_state("cracked" if cracked_output else "running")
 
@@ -637,10 +664,9 @@ def main() -> int:
             # while the last hashcat run was in progress; they were never
             # tried, so there's no reason to leave them on disk.
             leftovers = discover_files(work_dir, args.prefix)
-            for path in leftovers.values():
-                path.unlink(missing_ok=True)
-            if leftovers:
-                logger.info("FILES DELETED (unprocessed leftovers) count=%d", len(leftovers))
+            deleted = sum(1 for path in leftovers.values() if safe_unlink(path, logger))
+            if deleted:
+                logger.info("FILES DELETED (unprocessed leftovers) count=%d", deleted)
         persist_state("cracked")
     elif exit_code == 1:
         print("\n[crack_runner] Exhausted all generated dictionaries without cracking the hash.")
