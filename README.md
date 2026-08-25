@@ -50,6 +50,7 @@ The system efficiently handles massive wordlists by streaming output into multip
 - **hashcat** (installed and in PATH, or specify with `--hashcat-bin`)
   - For portable installations, place it in a folder with `OpenCL/` or `modules/` subdirectories
 - **For RAR files**: Ensure hashcat is compiled with RAR support (hashcat mode 13000 for RAR5, 23800 for RAR4)
+- **rar2john** (from the John the Ripper jumbo build), only needed if you use `rar2hash.ps1` / `start.ps1` to extract a hash from a `.rar` file yourself
 
 ### Setup
 
@@ -144,11 +145,56 @@ python crack_runner.py seed.json target.hash -m 1000 \
     --log-level DEBUG
 ```
 
-### Windows PowerShell Helper
+### Windows PowerShell Helpers
+
+Rather than typing `crack_runner.py` invocations by hand, the repo ships PowerShell helpers for Windows users.
+
+#### start.ps1 — guided menu (recommended entry point)
+
+```powershell
+.\start.ps1
+```
+
+Launches an interactive, menu-driven console that ties the rest of the scripts together:
+
+```
+  1. Check prerequisites (hashcat, rar2john)
+  2. Get hash from a RAR archive
+  3. Resume an existing run
+  4. Create a new seed.json and open it
+  5. Start a new hashcat run
+  Q. Quit
+```
+
+- **Check prerequisites** — verifies `hashcat`, `rar2john`, and `python` are on PATH, with install hints for anything missing.
+- **Get hash from a RAR archive** — runs `rar2hash.ps1` (see below).
+- **Resume an existing run** — lists any `hashcat_run_*` directories found in the repo, then runs `resume.ps1`.
+- **Create a new seed.json** — copies `seed_example.json` to a name you choose (default `seed.json`) and opens it in your default editor.
+- **Start a new hashcat run** — prompts for every relevant `crack_runner.py` option (seed file, target, `-m` hash type, work-dir, prefix, `--performance`/workload, `--hashcat-args`, `--keep-dictionaries`, `--force`), pre-filling sensible defaults from files already in the folder. The dictionary-generation options are broken out into their own separate guided questions (minimum/maximum length, max repeat, split by size or word count, quiet mode, plus a free-form field for any other `dict_gen.py` flag) rather than one combined `--dictgen-args` string, then shows the exact command line for confirmation before running it.
+
+#### rar2hash.ps1 — extract a hash from a RAR file
+
+```powershell
+.\rar2hash.ps1
+```
+
+Prompts for a `.rar` file path, runs `rar2john` against it, and writes the extracted hash to `<file>.rar.hash` (UTF-8, no BOM). Asks before overwriting an existing `.hash` file.
+
+#### resume.ps1 — resume a stopped run
+
+```powershell
+.\resume.ps1
+```
+
+Prompts for a `hashcat_run_*` directory (name or path) and runs `python crack_runner.py --resume <dir>`, replaying the original run's saved parameters.
+
+#### run.ps1 — fixed example command
 
 ```powershell
 .\run.ps1  # Executes: python crack_runner.py seed.json file.rar.hash -m 13000 ...
 ```
+
+A non-interactive example invocation; edit it directly if you want a one-command shortcut for a specific recovery, or use `start.ps1` for a guided prompt instead.
 
 ## Configuration
 
@@ -322,7 +368,7 @@ The project is designed for Windows and Unix systems:
 - **Progress bars**: Automatically falls back from ANSI escape sequences to carriage-return updates on legacy cmd.exe
 - **Portable hashcat**: Auto-detects and sets working directory for portable distributions
 - **Path handling**: Resolves paths correctly across platforms
-- **PowerShell integration**: `run.ps1` script for easy execution
+- **PowerShell integration**: `start.ps1` (guided menu), `rar2hash.ps1`, `resume.ps1`, and `run.ps1` for easy execution
 
 ## Testing
 
