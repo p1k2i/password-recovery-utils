@@ -85,6 +85,49 @@ function Wait-ForKey {
     Read-Host "Press Enter to return to the menu" | Out-Null
 }
 
+function Read-DictGenArgs {
+    Write-Host ""
+    Write-Host "Dictionary generation options (passed to dict_gen.py):" -ForegroundColor Cyan
+
+    $parts = New-Object System.Collections.Generic.List[string]
+
+    $minLength = Read-Host "  Minimum password length [default: 0]"
+    if (-not [string]::IsNullOrWhiteSpace($minLength)) {
+        $parts.Add("--min-length"); $parts.Add($minLength)
+    }
+
+    $maxLength = Read-Host "  Maximum password length [default: 32]"
+    if (-not [string]::IsNullOrWhiteSpace($maxLength)) {
+        $parts.Add("--max-length"); $parts.Add($maxLength)
+    }
+
+    $maxRepeat = Read-Host "  Max times a single piece may repeat per password (blank = unlimited)"
+    if (-not [string]::IsNullOrWhiteSpace($maxRepeat)) {
+        $parts.Add("--max-repeat"); $parts.Add($maxRepeat)
+    }
+
+    Write-Host "  Split generated dictionary files by size or by word count (blank both to skip):" -ForegroundColor DarkGray
+    $splitSize = Read-Host "  Split by file size, e.g. 10MB, 500K, 2GiB (blank = skip)"
+    if (-not [string]::IsNullOrWhiteSpace($splitSize)) {
+        $parts.Add("--split-size"); $parts.Add($splitSize)
+    } else {
+        $splitCount = Read-Host "  Split by word count, e.g. 1000000 (blank = skip)"
+        if (-not [string]::IsNullOrWhiteSpace($splitCount)) {
+            $parts.Add("--split-count"); $parts.Add($splitCount)
+        }
+    }
+
+    $quiet = Read-YesNo -Prompt "  Suppress dict_gen's live progress display (--quiet)?" -DefaultYes $false
+    if ($quiet) { $parts.Add("--quiet") }
+
+    $advanced = Read-Host "  Any other dict_gen.py arguments, quoted as one string (advanced, optional)"
+    if (-not [string]::IsNullOrWhiteSpace($advanced)) {
+        $parts.Add($advanced)
+    }
+
+    return ($parts -join ' ')
+}
+
 # --- Prerequisite checks ------------------------------------------------------
 
 function Invoke-PrereqCheck {
@@ -242,8 +285,8 @@ function Invoke-NewRun {
         $workload = Read-NonEmpty -Prompt "Workload" -Default "3"
     }
 
-    # --- Optional: dictgen-args / hashcat-args ---
-    $dictgenArgs = Read-Host "Extra dict_gen.py arguments, e.g. `"--min-length 8 --max-length 16`" [optional]"
+    # --- Optional: dictgen-args (guided, one question per option) / hashcat-args ---
+    $dictgenArgs = Read-DictGenArgs
     $hashcatArgs = Read-Host "Extra hashcat arguments, e.g. `"-w 2`" [optional]"
 
     # --- Optional: keep dictionaries / force ---
