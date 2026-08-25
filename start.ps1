@@ -91,15 +91,11 @@ function Read-DictGenArgs {
 
     $parts = New-Object System.Collections.Generic.List[string]
 
-    $minLength = Read-Host "  Minimum password length [default: 0]"
-    if (-not [string]::IsNullOrWhiteSpace($minLength)) {
+    $minLength = Read-NonEmpty -Prompt "  Minimum password length" -Default "0"
         $parts.Add("--min-length"); $parts.Add($minLength)
-    }
 
-    $maxLength = Read-Host "  Maximum password length [default: 32]"
-    if (-not [string]::IsNullOrWhiteSpace($maxLength)) {
+    $maxLength = Read-NonEmpty -Prompt "  Maximum password length" -Default "32"
         $parts.Add("--max-length"); $parts.Add($maxLength)
-    }
 
     $maxRepeat = Read-Host "  Max times a single piece may repeat per password (blank = unlimited)"
     if (-not [string]::IsNullOrWhiteSpace($maxRepeat)) {
