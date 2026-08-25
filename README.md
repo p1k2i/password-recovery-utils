@@ -96,6 +96,19 @@ python dict_gen.py seed.json \
     --max-repeat 2
 ```
 
+### Performance Mode (GPU Optimization)
+
+For maximum GPU speed, use the `--performance` flag to automatically apply hashcat's speed-oriented settings:
+
+```bash
+python crack_runner.py seed.json file.rar.hash -m 13000 \
+    --performance \
+    --workload 3 \
+    --work-dir ./fast_recovery
+```
+
+This applies `-O` (optimized kernels), `-w N` (workload profile), and `--force` to skip hardware warnings. Workload options: 1=Low, 2=Default, 3=High (default), 4=Nightmare. Adjust based on system load (higher = faster but GPU becomes unresponsive for other tasks).
+
 ### Full Recovery with Custom Hashcat Options
 
 ```bash
@@ -196,6 +209,10 @@ optional arguments:
   --hashcat-cwd         Working directory for hashcat (default: auto-detect for portable installs)
   --dictgen-args        Extra dict_gen arguments, quoted as one string
   --hashcat-args        Extra hashcat arguments, quoted as one string
+  --performance         Apply standard speed-oriented hashcat flags: -O (optimized kernels),
+                        -w (workload profile), and --force (skip hardware warnings)
+  --workload            Workload profile for --performance: 1=Low, 2=Default, 3=High (default),
+                        4=Nightmare (GPU unresponsive). Has no effect without --performance
   --poll-interval       Seconds between checks for new files (default: 1.0)
   --keep-dictionaries   Keep each file after hashcat tries it (default: delete)
   --force               Allow reusing work-dir with existing files
@@ -291,8 +308,13 @@ hashcat -m 13000 file.rar  # hashcat extracts it automatically
 2. **Estimate Output**: Use dict_gen to estimate total words before a long recovery attempt
 3. **Monitor Disk**: Dictionary files can grow rapidly; use `--split-size` or `--split-count` to manage space
 4. **Log Rotation**: Long-running recoveries benefit from log rotation (configured via `--log-max-bytes` and `--log-backups`)
-5. **Hashcat Optimization**: Pass `--hashcat-args "--force -O -w 3"` for GPU optimization (adjust `-w` based on system load)
-6. **Resume**: If interrupted, rerun with the same `--work-dir` and `--prefix` (use `--force` to clear stale files)
+5. **Performance Mode**: Use `--performance` for GPU acceleration with sensible defaults:
+   - **Default (`--workload 3`)**: Balances speed and system responsiveness; suitable for most scenarios
+   - **High (`--workload 4`)**: Maximum speed but GPU becomes unresponsive; use only for dedicated recovery machines
+   - **Low (`--workload 1`)**: Minimal system impact; use when running alongside other tasks
+   - Note: Some hash types with `-O` flag cap password length; check hashcat docs if needed
+6. **Custom Optimization**: For fine-tuned control, skip `--performance` and use `--hashcat-args` directly
+7. **Resume**: If interrupted, rerun with the same `--work-dir` and `--prefix` (use `--force` to clear stale files)
 
 ## Troubleshooting
 
@@ -334,6 +356,7 @@ python crack_runner.py ... --hashcat-bin /usr/bin/hashcat
 - **Generator is the bottleneck**: Disk I/O and rule checking are the limiting factors; hashcat typically runs faster
 - **Streaming is efficient**: The file-by-file approach minimizes peak memory and disk usage
 - **Position/relation rules**: Complex constraints can slow generation significantly; test with `--quiet` to measure
+- **`--performance` mode**: Applies `-O`, `-w`, and `--force` to hashcat. User-supplied `--hashcat-args` take precedence if overlapping (e.g., `--hashcat-args "-w 2"` downgrades workload despite `--performance` default). Use `--performance` for GPU-accelerated recoveries; disable with custom `--hashcat-args` for CPU-only cracking
 
 ## License
 
