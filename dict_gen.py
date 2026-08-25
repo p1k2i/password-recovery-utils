@@ -514,6 +514,118 @@ def estimate_total(pieces, min_length: int, max_length: int) -> int:
     return sum(counts[max(min_length, 1):max_length + 1])
 
 
+DEFAULT_CHECKPOINT_INTERVAL = 1_000_000
+CHECKPOINT_SUFFIX = ".ckpt.jsonl"
+
+
+def default_checkpoint_path(out_dir: Path, prefix: str) -> Path:
+    """Where the resume checkpoint index for a given prefix lives. Named so
+    it never collides with the <prefix>-N.txt data files (and so crack_runner,
+    which only ever deletes files matching that data pattern, leaves it
+    alone)."""
+    return out_dir / f"{prefix}{CHECKPOINT_SUFFIX}"
+
+
+def compute_run_signature(rules: "PieceRules", min_length: int, max_length: int,
+                          global_max_repeat: Optional[int]) -> str:
+    """A stable fingerprint of everything that determines the emission order
+    of candidates. A checkpoint map is only reusable for a resume whose
+    signature matches the run that wrote it -- otherwise the saved DFS paths
+    would point at different words and we must fall back to a plain skip."""
+    import hashlib
+
+    canonical = {
+        "pieces": rules.pieces,
+        "max_repeat_overrides": {k: rules.max_repeat_overrides[k]
+                                 for k in sorted(rules.max_repeat_overrides)},
+        "exclusive_of": {k: sorted(rules.exclusive_of[k])
+                         for k in sorted(rules.exclusive_of) if rules.exclusive_of[k]},
+        "requires": {k: sorted(rules.requires[k])
+                     for k in sorted(rules.requires) if rules.requires[k]},
+        "position_rules": {k: rules.position_rules[k] for k in sorted(rules.position_rules)},
+        "position_excludes": {k: rules.position_excludes[k]
+                              for k in sorted(rules.position_excludes)},
+        "relations": [[rel.mode, rel.pieces] for rel in rules.relations],
+        "min_length": min_length,
+        "max_length": max_length,
+        "global_max_repeat": global_max_repeat,
+    }
+    blob = json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+class CheckpointStore:
+    """A light on-disk index that turns resume from an O(N) walk into an
+    O(remainder) one.
+
+    While generating, we periodically record a checkpoint: the DFS path (the
+    sequence of piece indices) of the candidate at ordinal `base`, meaning
+    "candidate number base+1 sits exactly here". To resume at skip_count S we
+    load the checkpoint with the largest base <= S, rebuild the DFS directly
+    at that node, and only walk the (S - base) remaining candidates the slow
+    way -- at most one interval's worth -- instead of re-deriving all S of
+    them from zero.
+
+    File format: a JSON header line ({version, signature, interval}) followed
+    by one compact JSON array per checkpoint: [base, [piece_index, ...]].
+    Entries are appended (and fsync-flushed) as generation proceeds, so an
+    interrupted run still leaves a usable, non-corrupt index."""
+
+    def __init__(self, path: Path, signature: str, interval: int):
+        self.path = path
+        self.signature = signature
+        self.interval = interval
+        self._fh = None
+
+    @staticmethod
+    def load(path: Path):
+        """Return (meta, entries) with entries sorted by base, or None if the
+        file is absent, empty, or unreadable/corrupt."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        if not lines:
+            return None
+        try:
+            meta = json.loads(lines[0])
+            entries = []
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                base, path_indices = json.loads(line)
+                entries.append((int(base), [int(i) for i in path_indices]))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+        entries.sort(key=lambda e: e[0])
+        return meta, entries
+
+    def _write_header(self, fh) -> None:
+        fh.write(json.dumps(
+            {"version": 1, "signature": self.signature, "interval": self.interval}) + "\n")
+
+    def open_fresh(self, keep_entries=()) -> None:
+        """Start (or restart) the index file, optionally seeding it with a
+        prefix of still-valid entries kept from a prior run."""
+        self._fh = open(self.path, "w", encoding="utf-8")
+        self._write_header(self._fh)
+        for base, path_indices in keep_entries:
+            self._fh.write(json.dumps([base, path_indices]) + "\n")
+        self._fh.flush()
+
+    def append(self, base: int, path_indices: List[int]) -> None:
+        if self._fh is None:
+            return
+        self._fh.write(json.dumps([base, path_indices]) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
 def fmt_duration(seconds: float) -> str:
     if seconds < 0 or seconds == float("inf"):
         return "--:--:--"
@@ -661,7 +773,9 @@ def _position_matches(spec: PositionSpec, index0: int, total: int) -> bool:
 
 def generate(rules: PieceRules, min_length: int, max_length: int,
              global_max_repeat: Optional[int], writer: OutputWriter,
-             progress: "ProgressReporter", skip_count: int = 0) -> None:
+             progress: "ProgressReporter", skip_count: int = 0,
+             resume_path: Optional[List[int]] = None, base_count: int = 0,
+             checkpoint_interval: int = 0, checkpoint_sink=None) -> None:
     """DFS over sequences of pieces (repetition allowed, subject to each
     piece's rules). Every intermediate concatenation whose length is
     within [min_length, max_length], whose used pieces satisfy all
@@ -673,13 +787,38 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
     each appended piece.
 
     If skip_count > 0, the first skip_count valid candidates are skipped
-    without writing (used for resume functionality)."""
+    without writing (used for resume functionality).
+
+    Fast resume: `resume_path` is the DFS path (piece indices) of a saved
+    checkpoint whose candidate ordinal is `base_count`. When given, the walk
+    descends straight to that node instead of re-deriving the base_count
+    candidates before it -- every subtree strictly to the left of the path is
+    skipped outright (never even entered), and the path's own proper-ancestor
+    nodes are traversed but neither counted nor emitted (they were already
+    emitted before the checkpoint). Counting resumes exactly at the checkpoint
+    node, so the ordinary `skip_count` logic then handles only the small
+    remainder between the checkpoint and the requested resume point. This
+    reproduces byte-for-byte the same tail a from-zero skip would, because
+    pre-order DFS visits the checkpoint node and everything after it in the
+    identical order regardless of where the walk is entered.
+
+    If `checkpoint_interval` > 0 and `checkpoint_sink` is given, a checkpoint
+    (base ordinal + path) is emitted via the sink every `checkpoint_interval`
+    counted candidates, building the index a future resume will use."""
 
     pieces = rules.pieces
     min_piece_len = min(len(p) for p in pieces)
     usage_counts: Dict[str, int] = {}
     sequence: List[str] = []
-    candidates_seen = [0]  # Use list to allow modification in nested function
+    seq_indices: List[int] = []
+    candidates_seen = [base_count]  # Use list to allow modification in nested function
+    resume_len = len(resume_path) if resume_path else 0
+    # Next candidate ordinal-1 at which to record a checkpoint. Bases are
+    # multiples of the interval (0, interval, 2*interval, ...); candidates_seen
+    # increases by exactly 1 per counted candidate, so an equality test against
+    # this threshold hits every boundary without a per-candidate modulo.
+    recording = checkpoint_interval > 0 and checkpoint_sink is not None
+    next_ckpt_base = [base_count - (base_count % checkpoint_interval)] if recording else [0]
 
     # Pieces that must never be immediate neighbors ("separate" relations).
     # Adjacency is a fixed, local fact that can't be undone by later
@@ -757,18 +896,30 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
         matches = _position_matches(spec, index0, index0 + 1)
         return matches if kind == "allow" else not matches
 
-    def recurse(current: str, current_len: int) -> None:
-        if (current and min_length <= current_len <= max_length
+    def recurse(current: str, current_len: int, depth: int, on_path: bool) -> None:
+        # While seeking down a resume path, a proper ancestor of the checkpoint
+        # node is traversed (to rebuild DFS state) but neither counted nor
+        # emitted -- it was already emitted before the checkpoint. The
+        # checkpoint node itself (depth == resume_len) and every off-path node
+        # are handled normally.
+        seeking_ancestor = on_path and depth < resume_len
+        if (not seeking_ancestor
+                and current and min_length <= current_len <= max_length
                 and requirements_satisfied() and positions_satisfied()
                 and relations_satisfied()):
             candidates_seen[0] += 1
+            if recording and candidates_seen[0] - 1 == next_ckpt_base[0]:
+                checkpoint_sink(candidates_seen[0] - 1, list(seq_indices))
+                next_ckpt_base[0] += checkpoint_interval
             if candidates_seen[0] > skip_count:
                 writer.write(current)
                 progress.update(writer)
         if current_len + min_piece_len > max_length:
             return
-        next_index0 = len(sequence)
-        for piece in pieces:
+        next_index0 = depth
+        start = resume_path[depth] if seeking_ancestor else 0
+        for j in range(start, len(pieces)):
+            piece = pieces[j]
             limit = repeat_limit(piece)
             if limit is not None and usage_counts.get(piece, 0) >= limit:
                 continue
@@ -780,13 +931,16 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
                 continue
             usage_counts[piece] = usage_counts.get(piece, 0) + 1
             sequence.append(piece)
-            recurse(current + piece, current_len + len(piece))
+            seq_indices.append(j)
+            child_on_path = seeking_ancestor and j == resume_path[depth]
+            recurse(current + piece, current_len + len(piece), depth + 1, child_on_path)
+            seq_indices.pop()
             sequence.pop()
             usage_counts[piece] -= 1
             if usage_counts[piece] == 0:
                 del usage_counts[piece]
 
-    recurse("", 0)
+    recurse("", 0, 0, resume_path is not None)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -837,6 +991,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number output files starting after N instead of from 1, e.g. --start-index 3 writes "
              "<prefix>-4.txt first. Used together with --skip-count; see its help.")
     parser.add_argument(
+        "--checkpoint-interval", type=int, default=DEFAULT_CHECKPOINT_INTERVAL,
+        help="While generating, record a resume checkpoint (a compact DFS-path "
+             f"entry in <out-dir>/<prefix>{CHECKPOINT_SUFFIX}) every N candidates "
+             f"(default: {DEFAULT_CHECKPOINT_INTERVAL:,}; 0 disables). A later "
+             "--skip-count/--resume then jumps straight to the nearest checkpoint "
+             "instead of re-deriving every skipped candidate from the start, so "
+             "resume cost stays flat no matter how far in it is. The index is tiny "
+             "(one short line per interval) and self-heals if the seed/limits change.")
+    parser.add_argument(
         "--quiet", action="store_true",
         help="Suppress the live progress display")
     return parser
@@ -860,6 +1023,8 @@ def main() -> None:
         parser.error("--skip-count must be >= 0")
     if args.start_index < 0:
         parser.error("--start-index must be >= 0")
+    if args.checkpoint_interval < 0:
+        parser.error("--checkpoint-interval must be >= 0 (0 disables checkpointing)")
     if args.resume and (args.skip_count is not None or args.start_index):
         parser.error("--resume cannot be combined with --skip-count/--start-index -- they are two "
                       "different ways to resume (detecting existing files vs. explicit counts), "
@@ -893,18 +1058,59 @@ def main() -> None:
             print(f"[dict_gen] Resuming generation: skipping first {skip_count:,} words, "
                   f"starting at file {start_file_index + 1}", file=sys.stderr)
 
+    # Set up the resume checkpoint index. On a skipping run we try to load an
+    # existing index and seek straight to the nearest checkpoint at or before
+    # skip_count; on a from-scratch run we (re)build it. The index self-heals:
+    # a missing/corrupt file, or one whose signature no longer matches the seed
+    # and limits, is simply ignored and rewritten, falling back to a plain skip.
+    signature = compute_run_signature(rules, args.min_length, args.max_length, args.max_repeat)
+    checkpoint_path = default_checkpoint_path(args.out_dir, args.prefix)
+    resume_path = None
+    base_count = 0
+    keep_entries: List = []
+
+    if args.checkpoint_interval > 0 and skip_count > 0:
+        loaded = CheckpointStore.load(checkpoint_path)
+        if loaded is not None:
+            meta, entries = loaded
+            if meta.get("signature") == signature:
+                usable = [e for e in entries if e[0] <= skip_count]
+                if usable:
+                    base_count, resume_path = usable[-1]
+                    # Keep every checkpoint strictly before the one we resume
+                    # from; the resumed walk re-records base_count onward, so
+                    # dropping >= base_count avoids duplicate entries.
+                    keep_entries = [e for e in entries if e[0] < base_count]
+                    remaining = skip_count - base_count
+                    print(f"[dict_gen] Fast resume: seeking to checkpoint at {base_count:,} "
+                          f"candidates, then skipping {remaining:,} more (of {skip_count:,} "
+                          f"total) instead of re-deriving all from zero", file=sys.stderr)
+            else:
+                print("[dict_gen] Existing checkpoint index does not match this seed/limits; "
+                      "ignoring it and rebuilding (this resume will not be accelerated).",
+                      file=sys.stderr)
+
     total_estimate = estimate_total(rules.pieces, args.min_length, args.max_length)
     approx = args.max_repeat is not None or rules.has_constraints()
     progress = ProgressReporter(total_estimate, approx=approx, enabled=not args.quiet)
+
+    checkpoint_store = None
+    if args.checkpoint_interval > 0:
+        checkpoint_store = CheckpointStore(checkpoint_path, signature, args.checkpoint_interval)
+        checkpoint_store.open_fresh(keep_entries)
 
     writer = OutputWriter(args.out_dir, args.prefix, args.split_size, args.split_count,
                           start_file_index=start_file_index)
     try:
         generate(rules, args.min_length, args.max_length, args.max_repeat, writer, progress,
-                 skip_count=skip_count)
+                 skip_count=skip_count, resume_path=resume_path, base_count=base_count,
+                 checkpoint_interval=args.checkpoint_interval,
+                 checkpoint_sink=checkpoint_store.append if checkpoint_store else None)
     finally:
         progress.finish(writer)
         writer.close()
+        if checkpoint_store is not None:
+            checkpoint_store.close()
 
     print(
         f"Done. {writer.total_written} words written across {writer.file_index} file(s){resume_msg}.",
