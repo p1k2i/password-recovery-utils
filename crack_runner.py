@@ -17,7 +17,9 @@ Example:
     python crack_runner.py seed.json hash.txt -m 1000 \
         --work-dir ./run1 \
         --dictgen-args "--min-length 4 --max-length 10 --max-repeat 2" \
-        --hashcat-args "--force -O -w 3"
+        --performance
+    # --performance is shorthand for handing hashcat "--force -O -w 3"; the
+    # equivalent spelled out by hand would be --hashcat-args "--force -O -w 3"
 """
 
 import argparse
@@ -71,6 +73,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hashcat-args", default="",
                         help="Extra arguments passed through to hashcat, quoted as one string, "
                              "e.g. \"--force -O -w 3\"")
+    parser.add_argument("--performance", action="store_true",
+                        help="Shorthand for handing hashcat a standard set of speed-oriented "
+                             "flags: '-O' (optimized kernels -- faster, but caps the max "
+                             "supported password length for some hash types), '-w N' (workload "
+                             "profile, see --workload), and '--force' (skip hashcat's hardware "
+                             "warnings, e.g. for a GPU it considers unstable). Combine with "
+                             "--hashcat-args for anything these don't cover -- your own flags win "
+                             "if they overlap (e.g. --hashcat-args \"-w 2\" downgrades the workload "
+                             "--performance would otherwise set).")
+    parser.add_argument("--workload", type=int, default=3, choices=(1, 2, 3, 4),
+                        help="Workload profile used by --performance: 1=Low, 2=Default, 3=High, "
+                             "4=Nightmare (can make the GPU unresponsive for other use). Default: "
+                             "3. Has no effect unless --performance is also passed.")
     parser.add_argument("--poll-interval", type=float, default=1.0,
                         help="Seconds between checks for newly finished dictionary files (default: 1.0)")
     parser.add_argument("--keep-dictionaries", action="store_true",
@@ -272,7 +287,11 @@ def main() -> int:
             path.unlink()
 
     dictgen_extra = shlex.split(args.dictgen_args)
-    hashcat_extra = shlex.split(args.hashcat_args)
+    performance_flags = ["--force", "-O", "-w", str(args.workload)] if args.performance else []
+    hashcat_extra = performance_flags + shlex.split(args.hashcat_args)
+    if args.performance:
+        print(f"[crack_runner] Performance mode: hashcat gets {' '.join(performance_flags)} "
+              f"(plus any --hashcat-args, which take precedence on conflicts)")
 
     log_path = args.log_file or (work_dir / "crack_runner.log")
     logger = setup_logger(log_path, args.log_level, args.log_max_bytes, args.log_backups)
