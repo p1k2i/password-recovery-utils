@@ -20,10 +20,40 @@ Example:
         --performance
     # --performance is shorthand for handing hashcat "--force -O -w 3"; the
     # equivalent spelled out by hand would be --hashcat-args "--force -O -w 3"
+
+Resuming a stopped run:
+    python crack_runner.py --continue ./run1
+
+The work directory (--work-dir, e.g. ./run1) is a self-contained
+checkpoint: it holds a state.json recording every argument the first run
+was given, a local copy of the seed dictionary, and a local copy of the
+hash target (if the target was a file rather than a bare hash string).
+--continue accepts either that state.json directly or the directory
+containing it. No other arguments may be given alongside --continue --
+every original parameter is replayed from the saved state, so the run
+resumes exactly as configured the first time. The only things NOT taken
+from the saved state are the python interpreter and the dict_gen.py
+script path, which are always re-resolved the normal way (relative to
+wherever crack_runner.py is currently being run from) -- those are the
+"program installed on this PC" side of things, not part of the portable
+run folder, so the folder can be copied to another machine or location
+and resumed there as long as dict_gen.py/crack_runner.py and hashcat are
+available on that machine too.
+
+Resuming re-runs dict_gen.py from scratch -- generation is fully
+deterministic (same seed and arguments always produce byte-identical
+files in the same order), so this regenerates exactly the same
+dictionary files as before at low CPU cost. Any file already recorded as
+processed is recognized and skipped (deleted without wasting a hashcat
+run on it) the moment it reappears; hashcat only resumes attacking from
+the first word list that wasn't tried yet, so no GPU time is wasted
+redoing already-tried passwords.
 """
 
 import argparse
+import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -32,9 +62,10 @@ import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+STATE_FILENAME = "state.json"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -42,13 +73,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Generate a brute-force dictionary with dict_gen.py and feed it to "
                     "hashcat file by file, stopping as soon as the hash is cracked."
     )
-    parser.add_argument("seed", type=Path,
-                        help="Seed dictionary file passed to dict_gen.py (.txt or .json)")
-    parser.add_argument("target",
+    parser.add_argument("seed", type=Path, nargs="?", default=None,
+                        help="Seed dictionary file passed to dict_gen.py (.txt or .json). "
+                             "Not given (and not allowed) with --continue.")
+    parser.add_argument("target", nargs="?", default=None,
                         help="What hashcat should attack: a hash string, or a path to a "
-                             "file containing hash(es)")
-    parser.add_argument("-m", "--hash-type", type=int, required=True,
-                        help="hashcat -m hash type")
+                             "file containing hash(es). Not given (and not allowed) with "
+                             "--continue.")
+    parser.add_argument("-m", "--hash-type", type=int, default=None,
+                        help="hashcat -m hash type. Required unless --continue is given.")
+    parser.add_argument("--continue", dest="continue_path", type=Path, default=None,
+                        metavar="PATH",
+                        help="Resume a previously stopped run instead of starting a new one. "
+                             "PATH is either the --work-dir from that run or its state.json "
+                             "directly. Must be the ONLY argument given -- every original "
+                             "parameter (seed, target, hash type, dict_gen/hashcat flags, "
+                             "performance mode, etc.) is replayed from the run's saved state, "
+                             "so it cannot be changed at resume time. See 'Resuming a stopped "
+                             "run' above.")
     parser.add_argument("--work-dir", type=Path, default=None,
                         help="Directory to generate dictionary files into "
                              "(default: ./hashcat_run_<timestamp>)")
@@ -255,14 +297,193 @@ def terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
         proc.wait()
 
 
+def check_continue_argv(argv: List[str], parser: argparse.ArgumentParser) -> None:
+    """argparse alone can't express "this flag must be given alone" --
+    enforce it by inspecting raw argv. Exits with an error if --continue is
+    combined with anything else, since every original parameter is supposed
+    to be replayed from the saved state rather than re-specified."""
+    has_continue = any(a == "--continue" or a.startswith("--continue=") for a in argv)
+    if not has_continue:
+        return
+    valid = (len(argv) == 2 and argv[0] == "--continue") or \
+            (len(argv) == 1 and argv[0].startswith("--continue="))
+    if not valid:
+        parser.error(
+            "--continue must be the only argument given -- every original parameter is "
+            "replayed from the run's saved state, so it cannot be combined with anything else"
+        )
+
+
+def serializable_args(args: argparse.Namespace) -> dict:
+    result = {}
+    for key, value in vars(args).items():
+        if key == "continue_path":
+            continue
+        if isinstance(value, Path):
+            value = str(value)
+        result[key] = value
+    return result
+
+
+def save_state(state_path: Path, state: dict) -> None:
+    """Atomic write: a crash or Ctrl-C mid-write can never leave a
+    corrupted/partial state.json behind."""
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp_path, state_path)
+
+
+def load_state(state_path: Path) -> dict:
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read state file {state_path}: {exc}") from exc
+
+
+def resolve_state_path(continue_arg: Path) -> Tuple[Path, Path]:
+    """--continue accepts either the work directory or the state.json file
+    itself; return (state_path, work_dir) either way."""
+    if continue_arg.is_dir():
+        return continue_arg / STATE_FILENAME, continue_arg
+    return continue_arg, continue_arg.parent
+
+
+def init_fresh_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Tuple[Path, Path, dict]:
+    """Set up a brand new work directory: copy the seed (and, if it's a
+    file, the target) into it, and write the initial state.json. Returns
+    (work_dir, state_path, state)."""
+    if not args.seed.is_file():
+        parser.error(f"Seed dictionary not found: {args.seed}")
+
+    work_dir = args.work_dir or Path(f"hashcat_run_{int(time.time())}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    state_path = work_dir / STATE_FILENAME
+
+    existing = discover_files(work_dir, args.prefix)
+    if existing or state_path.is_file():
+        if not args.force:
+            reason = "a saved run state" if state_path.is_file() else \
+                f"{len(existing)} file(s) matching prefix '{args.prefix}'"
+            print(
+                f"Error: {work_dir} already has {reason}. Pick an empty --work-dir / "
+                f"different --prefix, or pass --force to wipe it and start fresh.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        for path in existing.values():
+            path.unlink()
+        state_path.unlink(missing_ok=True)
+
+    seed_local = work_dir / f"seed{args.seed.suffix}"
+    shutil.copyfile(args.seed, seed_local)
+
+    target_path = Path(args.target)
+    target_is_file = target_path.is_file()
+    target_filename = None
+    target_literal = None
+    if target_is_file:
+        target_filename = f"target{target_path.suffix}" if target_path.suffix else "target"
+        shutil.copyfile(target_path, work_dir / target_filename)
+    else:
+        target_literal = args.target
+
+    now = time.time()
+    state = {
+        "version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "args": serializable_args(args),
+        "seed_filename": seed_local.name,
+        "target_is_file": target_is_file,
+        "target_filename": target_filename,
+        "target_literal": target_literal,
+        "processed": [],
+        "cumulative_words": 0,
+        "cracked_output": None,
+        "status": "running",
+    }
+    save_state(state_path, state)
+    return work_dir, state_path, state
+
+
+def init_continue_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Tuple[Path, Path, dict]:
+    """Load a previous run's state.json and rehydrate `args` from it (every
+    task parameter comes from the saved state; args.python/dict_gen_script
+    are deliberately left untouched -- they're re-resolved fresh below as
+    the "installed program", not part of the portable run folder). Returns
+    (work_dir, state_path, state)."""
+    state_path, work_dir = resolve_state_path(args.continue_path)
+    if not state_path.is_file():
+        parser.error(
+            f"No {STATE_FILENAME} found at {args.continue_path} -- not a hashcat_run "
+            f"directory/state file"
+        )
+    try:
+        state = load_state(state_path)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
+    if state.get("cracked_output"):
+        print("[crack_runner] This run already found the password:")
+        print(state["cracked_output"])
+        sys.exit(0)
+
+    seed_local = work_dir / state["seed_filename"]
+    if not seed_local.is_file():
+        parser.error(
+            f"{work_dir} is missing its seed copy ({state['seed_filename']}) -- "
+            f"the hashcat_run folder is incomplete, cannot resume"
+        )
+    if state["target_is_file"]:
+        target_local = work_dir / state["target_filename"]
+        if not target_local.is_file():
+            parser.error(
+                f"{work_dir} is missing its target copy ({state['target_filename']}) -- "
+                f"the hashcat_run folder is incomplete, cannot resume"
+            )
+        target = str(target_local)
+    else:
+        target = state["target_literal"]
+
+    saved = state["args"]
+    args.seed = seed_local
+    args.target = target
+    args.hash_type = saved["hash_type"]
+    args.prefix = saved["prefix"]
+    args.dictgen_args = saved["dictgen_args"]
+    args.hashcat_args = saved["hashcat_args"]
+    args.performance = saved["performance"]
+    args.workload = saved["workload"]
+    args.poll_interval = saved["poll_interval"]
+    args.keep_dictionaries = saved["keep_dictionaries"]
+    args.hashcat_bin = saved["hashcat_bin"]
+    args.hashcat_cwd = Path(saved["hashcat_cwd"]) if saved["hashcat_cwd"] else None
+    args.log_level = saved["log_level"]
+    args.log_max_bytes = saved["log_max_bytes"]
+    args.log_backups = saved["log_backups"]
+    args.log_file = Path(saved["log_file"]) if saved["log_file"] else None
+    args.work_dir = work_dir
+    args.force = False
+
+    return work_dir, state_path, state
+
+
 def main() -> int:
-    args = build_arg_parser().parse_args()
     parser = build_arg_parser()
+    check_continue_argv(sys.argv[1:], parser)
+    args = parser.parse_args()
+
+    if args.continue_path is None:
+        missing = [name for name, val in (
+            ("seed", args.seed), ("target", args.target), ("-m/--hash-type", args.hash_type),
+        ) if val is None]
+        if missing:
+            parser.error(f"the following arguments are required: {', '.join(missing)}")
 
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be > 0")
-    if not args.seed.is_file():
-        parser.error(f"Seed dictionary not found: {args.seed}")
 
     try:
         dict_gen_script = resolve_dict_gen_script(args.dict_gen_script)
@@ -270,21 +491,13 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    work_dir = args.work_dir or Path(f"hashcat_run_{int(time.time())}")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    existing = discover_files(work_dir, args.prefix)
-    if existing:
-        if not args.force:
-            print(
-                f"Error: {work_dir} already has {len(existing)} file(s) matching prefix "
-                f"'{args.prefix}'. Pick an empty --work-dir / different --prefix, or pass --force "
-                f"to delete them and start fresh.",
-                file=sys.stderr,
-            )
-            return 1
-        for path in existing.values():
-            path.unlink()
+    resuming = args.continue_path is not None
+    if resuming:
+        work_dir, state_path, state = init_continue_run(args, parser)
+        print(f"[crack_runner] Resuming run in {work_dir} "
+              f"({len(state['processed'])} file(s) already processed)")
+    else:
+        work_dir, state_path, state = init_fresh_run(args, parser)
 
     dictgen_extra = shlex.split(args.dictgen_args)
     performance_flags = ["--force", "-O", "-w", str(args.workload)] if args.performance else []
@@ -296,7 +509,10 @@ def main() -> int:
     log_path = args.log_file or (work_dir / "crack_runner.log")
     logger = setup_logger(log_path, args.log_level, args.log_max_bytes, args.log_backups)
     print(f"[crack_runner] Run history logged to {log_path} (level {args.log_level})")
-    logger.info("START config=%s", vars(args))
+    if resuming:
+        logger.info("RESUME state=%s processed=%d", state_path, len(state["processed"]))
+    else:
+        logger.info("START config=%s", vars(args))
 
     hashcat_exe, hashcat_cwd = resolve_hashcat(args.hashcat_bin, args.hashcat_cwd)
     if hashcat_cwd:
@@ -313,10 +529,11 @@ def main() -> int:
         dictgen_extra, work_dir / "dictgen.log", logger,
     )
 
-    processed: set = set()
-    cracked_output: Optional[str] = None
+    processed: set = set(state["processed"])
+    skipped_cleanup: set = set()
+    cracked_output: Optional[str] = state.get("cracked_output")
     exit_code = 1
-    cumulative_words = 0
+    cumulative_words = state["cumulative_words"]
 
     def progress_suffix() -> str:
         if not total_estimate:
@@ -324,15 +541,37 @@ def main() -> int:
         pct = min(cumulative_words / total_estimate * 100, 100.0)
         return f" cumulative={cumulative_words:,}/{total_estimate:,} ({pct:.1f}%{'~' if approx else ''})"
 
+    def persist_state(status: str) -> None:
+        state["processed"] = sorted(processed)
+        state["cumulative_words"] = cumulative_words
+        state["cracked_output"] = cracked_output
+        state["status"] = status
+        state["updated_at"] = time.time()
+        save_state(state_path, state)
+
     try:
         while True:
             files = discover_files(work_dir, args.prefix)
             generator_done = generator.poll() is not None
 
+            # dict_gen.py always restarts numbering from 1, so after
+            # --continue it will deterministically regenerate files already
+            # tried in a previous invocation. Recognize and clean those up
+            # without wasting a hashcat run on them.
+            for i in sorted(files):
+                if i in processed and i not in skipped_cleanup:
+                    if not args.keep_dictionaries:
+                        files[i].unlink(missing_ok=True)
+                        logger.info("FILE SKIPPED (already processed) %s", files[i].name)
+                    skipped_cleanup.add(i)
+
             if generator_done:
-                ready = sorted(i for i in files if i not in processed)
+                ready = sorted(i for i in files if i not in processed and i not in skipped_cleanup)
             else:
-                ready = sorted(i for i in files if i not in processed and (i + 1) in files)
+                ready = sorted(
+                    i for i in files
+                    if i not in processed and i not in skipped_cleanup and (i + 1) in files
+                )
 
             for i in ready:
                 path = files[i]
@@ -351,6 +590,7 @@ def main() -> int:
                     logger.error("HASHCAT ERROR %s rc=%d", path.name, rc)
                     terminate(generator)
                     logger.info("GEN STOP reason=hashcat_error")
+                    persist_state("error")
                     return 1
 
                 processed.add(i)
@@ -365,6 +605,8 @@ def main() -> int:
                 if not args.keep_dictionaries:
                     path.unlink(missing_ok=True)
                     logger.info("FILE DELETED %s", path.name)
+
+                persist_state("cracked" if cracked_output else "running")
 
                 if cracked_output:
                     break
@@ -381,6 +623,7 @@ def main() -> int:
         print("\n[crack_runner] Interrupted, stopping...", file=sys.stderr)
         logger.warning("INTERRUPTED by user after %d file(s)%s", len(processed), progress_suffix())
         exit_code = 130
+        persist_state("interrupted")
     finally:
         terminate(generator)
         logger.info("GEN STOP")
@@ -398,9 +641,11 @@ def main() -> int:
                 path.unlink(missing_ok=True)
             if leftovers:
                 logger.info("FILES DELETED (unprocessed leftovers) count=%d", len(leftovers))
+        persist_state("cracked")
     elif exit_code == 1:
         print("\n[crack_runner] Exhausted all generated dictionaries without cracking the hash.")
         logger.info("EXHAUSTED files=%d%s", len(processed), progress_suffix())
+        persist_state("exhausted")
 
     return exit_code
 
