@@ -425,17 +425,43 @@ def load_dictionary(path: Path) -> PieceRules:
     return load_pieces_txt(path)
 
 
+def discover_existing_files(out_dir: Path, prefix: str) -> Dict[int, Path]:
+    """Map file index -> path for every <prefix>-N.txt file currently in
+    out_dir, similar to crack_runner's discover_files."""
+    import re
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)\.txt$")
+    found = {}
+    for path in out_dir.glob(f"{prefix}-*.txt"):
+        match = pattern.match(path.name)
+        if match:
+            found[int(match.group(1))] = path
+    return found
+
+
+def count_existing_words(files: Dict[int, Path]) -> int:
+    """Count total words already written across all existing files."""
+    total = 0
+    for path in sorted(files.values()):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                total += sum(1 for _ in f)
+        except (OSError, IOError):
+            pass
+    return total
+
+
 class OutputWriter:
     """Streams generated words to <prefix>-N.txt files, rolling over to
     a new file whenever the active size and/or word-count limit is hit."""
 
     def __init__(self, out_dir: Path, prefix: str,
-                 split_size: Optional[int], split_count: Optional[int]):
+                 split_size: Optional[int], split_count: Optional[int],
+                 start_file_index: int = 0):
         self.out_dir = out_dir
         self.prefix = prefix
         self.split_size = split_size
         self.split_count = split_count
-        self.file_index = 0
+        self.file_index = start_file_index
         self.current_file = None
         self.current_path = None
         self.current_size = 0
@@ -635,7 +661,7 @@ def _position_matches(spec: PositionSpec, index0: int, total: int) -> bool:
 
 def generate(rules: PieceRules, min_length: int, max_length: int,
              global_max_repeat: Optional[int], writer: OutputWriter,
-             progress: "ProgressReporter") -> None:
+             progress: "ProgressReporter", skip_count: int = 0) -> None:
     """DFS over sequences of pieces (repetition allowed, subject to each
     piece's rules). Every intermediate concatenation whose length is
     within [min_length, max_length], whose used pieces satisfy all
@@ -644,12 +670,16 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
     specific pieces sit relative to each other) all hold, is written out
     as a candidate password. Recursion always terminates because every
     piece has length >= 1, so the current length strictly grows with
-    each appended piece."""
+    each appended piece.
+
+    If skip_count > 0, the first skip_count valid candidates are skipped
+    without writing (used for resume functionality)."""
 
     pieces = rules.pieces
     min_piece_len = min(len(p) for p in pieces)
     usage_counts: Dict[str, int] = {}
     sequence: List[str] = []
+    candidates_seen = [0]  # Use list to allow modification in nested function
 
     # Pieces that must never be immediate neighbors ("separate" relations).
     # Adjacency is a fixed, local fact that can't be undone by later
@@ -731,8 +761,10 @@ def generate(rules: PieceRules, min_length: int, max_length: int,
         if (current and min_length <= current_len <= max_length
                 and requirements_satisfied() and positions_satisfied()
                 and relations_satisfied()):
-            writer.write(current)
-            progress.update(writer)
+            candidates_seen[0] += 1
+            if candidates_seen[0] > skip_count:
+                writer.write(current)
+                progress.update(writer)
         if current_len + min_piece_len > max_length:
             return
         next_index0 = len(sequence)
@@ -788,6 +820,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-repeat", type=int, default=None,
         help="Maximum number of times a single piece may repeat within one generated word")
     parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume generation from where a previous run left off: detect existing output files, "
+             "skip words already written, and continue generation in the next file")
+    parser.add_argument(
         "--quiet", action="store_true",
         help="Suppress the live progress display")
     return parser
@@ -816,19 +852,35 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Handle resume mode
+    skip_count = 0
+    start_file_index = 0
+    resume_msg = ""
+
+    if args.resume:
+        existing_files = discover_existing_files(args.out_dir, args.prefix)
+        if existing_files:
+            skip_count = count_existing_words(existing_files)
+            start_file_index = max(existing_files.keys())
+            resume_msg = f" (resuming from {skip_count:,} words across {start_file_index} file(s))"
+            print(f"[dict_gen] Resuming generation: skipping first {skip_count:,} words, "
+                  f"starting at file {start_file_index + 1}", file=sys.stderr)
+
     total_estimate = estimate_total(rules.pieces, args.min_length, args.max_length)
     approx = args.max_repeat is not None or rules.has_constraints()
     progress = ProgressReporter(total_estimate, approx=approx, enabled=not args.quiet)
 
-    writer = OutputWriter(args.out_dir, args.prefix, args.split_size, args.split_count)
+    writer = OutputWriter(args.out_dir, args.prefix, args.split_size, args.split_count,
+                          start_file_index=start_file_index)
     try:
-        generate(rules, args.min_length, args.max_length, args.max_repeat, writer, progress)
+        generate(rules, args.min_length, args.max_length, args.max_repeat, writer, progress,
+                 skip_count=skip_count)
     finally:
         progress.finish(writer)
         writer.close()
 
     print(
-        f"Done. {writer.total_written} words written across {writer.file_index} file(s).",
+        f"Done. {writer.total_written} words written across {writer.file_index} file(s){resume_msg}.",
         file=sys.stderr,
     )
 
