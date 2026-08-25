@@ -22,14 +22,14 @@ Example:
     # equivalent spelled out by hand would be --hashcat-args "--force -O -w 3"
 
 Resuming a stopped run:
-    python crack_runner.py --continue ./run1
+    python crack_runner.py --resume ./run1
 
 The work directory (--work-dir, e.g. ./run1) is a self-contained
 checkpoint: it holds a state.json recording every argument the first run
 was given, a local copy of the seed dictionary, and a local copy of the
 hash target (if the target was a file rather than a bare hash string).
---continue accepts either that state.json directly or the directory
-containing it. No other arguments may be given alongside --continue --
+--resume accepts either that state.json directly or the directory
+containing it. No other arguments may be given alongside --resume --
 every original parameter is replayed from the saved state, so the run
 resumes exactly as configured the first time. The only things NOT taken
 from the saved state are the python interpreter and the dict_gen.py
@@ -75,14 +75,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("seed", type=Path, nargs="?", default=None,
                         help="Seed dictionary file passed to dict_gen.py (.txt or .json). "
-                             "Not given (and not allowed) with --continue.")
+                             "Not given (and not allowed) with --resume.")
     parser.add_argument("target", nargs="?", default=None,
                         help="What hashcat should attack: a hash string, or a path to a "
                              "file containing hash(es). Not given (and not allowed) with "
-                             "--continue.")
+                             "--resume.")
     parser.add_argument("-m", "--hash-type", type=int, default=None,
-                        help="hashcat -m hash type. Required unless --continue is given.")
-    parser.add_argument("--continue", dest="continue_path", type=Path, default=None,
+                        help="hashcat -m hash type. Required unless --resume is given.")
+    parser.add_argument("--resume", dest="resume_path", type=Path, default=None,
                         metavar="PATH",
                         help="Resume a previously stopped run instead of starting a new one. "
                              "PATH is either the --work-dir from that run or its state.json "
@@ -297,19 +297,19 @@ def terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
         proc.wait()
 
 
-def check_continue_argv(argv: List[str], parser: argparse.ArgumentParser) -> None:
+def check_resume_argv(argv: List[str], parser: argparse.ArgumentParser) -> None:
     """argparse alone can't express "this flag must be given alone" --
-    enforce it by inspecting raw argv. Exits with an error if --continue is
+    enforce it by inspecting raw argv. Exits with an error if --resume is
     combined with anything else, since every original parameter is supposed
     to be replayed from the saved state rather than re-specified."""
-    has_continue = any(a == "--continue" or a.startswith("--continue=") for a in argv)
-    if not has_continue:
+    has_resume = any(a == "--resume" or a.startswith("--resume=") for a in argv)
+    if not has_resume:
         return
-    valid = (len(argv) == 2 and argv[0] == "--continue") or \
-            (len(argv) == 1 and argv[0].startswith("--continue="))
+    valid = (len(argv) == 2 and argv[0] == "--resume") or \
+            (len(argv) == 1 and argv[0].startswith("--resume="))
     if not valid:
         parser.error(
-            "--continue must be the only argument given -- every original parameter is "
+            "--resume must be the only argument given -- every original parameter is "
             "replayed from the run's saved state, so it cannot be combined with anything else"
         )
 
@@ -317,7 +317,7 @@ def check_continue_argv(argv: List[str], parser: argparse.ArgumentParser) -> Non
 def serializable_args(args: argparse.Namespace) -> dict:
     result = {}
     for key, value in vars(args).items():
-        if key == "continue_path":
+        if key == "resume_path":
             continue
         if isinstance(value, Path):
             value = str(value)
@@ -342,12 +342,12 @@ def load_state(state_path: Path) -> dict:
         raise RuntimeError(f"Could not read state file {state_path}: {exc}") from exc
 
 
-def resolve_state_path(continue_arg: Path) -> Tuple[Path, Path]:
-    """--continue accepts either the work directory or the state.json file
+def resolve_state_path(resume_arg: Path) -> Tuple[Path, Path]:
+    """--resume accepts either the work directory or the state.json file
     itself; return (state_path, work_dir) either way."""
-    if continue_arg.is_dir():
-        return continue_arg / STATE_FILENAME, continue_arg
-    return continue_arg, continue_arg.parent
+    if resume_arg.is_dir():
+        return resume_arg / STATE_FILENAME, resume_arg
+    return resume_arg, resume_arg.parent
 
 
 def init_fresh_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Tuple[Path, Path, dict]:
@@ -408,16 +408,16 @@ def init_fresh_run(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     return work_dir, state_path, state
 
 
-def init_continue_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Tuple[Path, Path, dict]:
+def init_resume_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Tuple[Path, Path, dict]:
     """Load a previous run's state.json and rehydrate `args` from it (every
     task parameter comes from the saved state; args.python/dict_gen_script
     are deliberately left untouched -- they're re-resolved fresh below as
     the "installed program", not part of the portable run folder). Returns
     (work_dir, state_path, state)."""
-    state_path, work_dir = resolve_state_path(args.continue_path)
+    state_path, work_dir = resolve_state_path(args.resume_path)
     if not state_path.is_file():
         parser.error(
-            f"No {STATE_FILENAME} found at {args.continue_path} -- not a hashcat_run "
+            f"No {STATE_FILENAME} found at {args.resume_path} -- not a hashcat_run "
             f"directory/state file"
         )
     try:
@@ -472,10 +472,10 @@ def init_continue_run(args: argparse.Namespace, parser: argparse.ArgumentParser)
 
 def main() -> int:
     parser = build_arg_parser()
-    check_continue_argv(sys.argv[1:], parser)
+    check_resume_argv(sys.argv[1:], parser)
     args = parser.parse_args()
 
-    if args.continue_path is None:
+    if args.resume_path is None:
         missing = [name for name, val in (
             ("seed", args.seed), ("target", args.target), ("-m/--hash-type", args.hash_type),
         ) if val is None]
@@ -491,9 +491,9 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    resuming = args.continue_path is not None
+    resuming = args.resume_path is not None
     if resuming:
-        work_dir, state_path, state = init_continue_run(args, parser)
+        work_dir, state_path, state = init_resume_run(args, parser)
         print(f"[crack_runner] Resuming run in {work_dir} "
               f"({len(state['processed'])} file(s) already processed)")
     else:
@@ -555,7 +555,7 @@ def main() -> int:
             generator_done = generator.poll() is not None
 
             # dict_gen.py always restarts numbering from 1, so after
-            # --continue it will deterministically regenerate files already
+            # --resume it will deterministically regenerate files already
             # tried in a previous invocation. Recognize and clean those up
             # without wasting a hashcat run on them.
             for i in sorted(files):
