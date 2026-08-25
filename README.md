@@ -24,6 +24,7 @@ The system efficiently handles massive wordlists by streaming output into multip
   - **Per-piece repeat limits**: Override global max-repeat for specific pieces
 - **Large-scale output**: Split generated dictionaries by size or word count to manage disk space
 - **Live progress tracking**: Real-time progress bar with Windows cmd.exe fallback (no ANSI requirement)
+- **Resume functionality**: Detect existing output files, skip already-written words, and continue generation seamlessly
 - **JSON seed format**: Full rule support via schema-driven JSON configuration
 - **Plain text seeds**: Simple one-piece-per-line format for basic use cases
 
@@ -32,6 +33,7 @@ The system efficiently handles massive wordlists by streaming output into multip
 - **Streaming generation**: Starts dictionary generation in the background while hashcat runs
 - **File-by-file processing**: Each generated file is processed only after generation completes (no partial reads)
 - **Early exit**: Stops immediately when password is cracked, terminating the generator
+- **Synchronized resume**: Both dict_gen.py and crack_runner.py support `--resume` for seamless recovery from interruptions—continue exactly where you left off across power failures, timeouts, or manual stops
 - **Robust hashcat integration**:
   - Auto-detects portable hashcat installations
   - Handles working directory configuration for OpenCL/modules lookup
@@ -71,6 +73,25 @@ python crack_runner.py seed.json file.rar.hash -m 13000 \
     --work-dir ./recovery_run \
     --dictgen-args "--min-length 12 --max-length 32"
 ```
+
+### Resume Interrupted Recovery
+
+If a recovery is interrupted (power failure, timeout, or manual stop), resume from where it left off:
+
+```bash
+# Original command was interrupted
+python crack_runner.py seed.json file.rar.hash -m 13000 \
+    --work-dir ./recovery_run \
+    --dictgen-args "--min-length 12 --max-length 32"
+
+# Resume: dict_gen.py automatically skips written words, crack_runner continues from next file
+python crack_runner.py seed.json file.rar.hash -m 13000 \
+    --work-dir ./recovery_run \
+    --prefix dict \
+    --dictgen-args "--min-length 12 --max-length 32 --resume"
+```
+
+Both scripts automatically detect existing files and synchronize seamlessly—no manual cleanup needed.
 
 ### Generating Dictionaries Only
 
@@ -236,6 +257,9 @@ optional arguments:
   --split-size          Split files by size, e.g., '10MB', '500K', '2GiB'
   --split-count         Split files by word count
   --max-repeat          Max repetitions of a piece per word
+  --resume              Resume from a previous interrupted run: detect existing output files,
+                        skip words already written, and continue generation in the next file.
+                        Synchronizes with crack_runner.py for seamless recovery
   --quiet               Suppress progress display
 ```
 
@@ -267,6 +291,18 @@ Generated as `<prefix>-1.txt`, `<prefix>-2.txt`, etc., with one candidate passwo
 4. **Output Splitting**: Words are streamed to files, rolling over when size or count limits are reached
 5. **Progress Tracking**: Live bar shows words/sec, ETA, and file-by-file details
 
+### Resume Process
+
+When `--resume` is passed to dict_gen.py:
+
+1. **File Discovery**: Scan output directory for existing `<prefix>-N.txt` files
+2. **Word Count**: Count total words already written across all files
+3. **Skip Calculation**: Advance file index and calculate skip count for generation
+4. **Skipping**: During DFS generation, count candidates and skip writing the first N matches
+5. **Continuation**: Resume writing from file N+1 onward, as if never interrupted
+
+This allows both dict_gen.py (when called standalone or via `--dictgen-args "--resume"`) and crack_runner.py (which manages its own resume state) to work synchronously after an interruption.
+
 ### Cracking Orchestration
 
 1. **Generator Start**: Launch dict_gen.py as a background subprocess, logging output
@@ -276,7 +312,8 @@ Generated as `<prefix>-1.txt`, `<prefix>-2.txt`, etc., with one candidate passwo
    - Launch hashcat with current file
    - Check for cracked passwords via `hashcat --show`
 3. **Early Exit**: Stop generator and terminate on success or exhaustion
-4. **Logging**: Record every event for reproducibility and debugging
+4. **Resume Support**: On restart, crack_runner detects completed files, skips them, and passes `--resume` to dict_gen to continue seamlessly
+5. **Logging**: Record every event for reproducibility and debugging
 
 ## Windows Compatibility
 
@@ -308,13 +345,19 @@ hashcat -m 13000 file.rar  # hashcat extracts it automatically
 2. **Estimate Output**: Use dict_gen to estimate total words before a long recovery attempt
 3. **Monitor Disk**: Dictionary files can grow rapidly; use `--split-size` or `--split-count` to manage space
 4. **Log Rotation**: Long-running recoveries benefit from log rotation (configured via `--log-max-bytes` and `--log-backups`)
-5. **Performance Mode**: Use `--performance` for GPU acceleration with sensible defaults:
+5. **Resume Best Practices**:
+   - If interrupted, always rerun with the **same `--work-dir` and `--prefix`** and the same `--dictgen-args`
+   - Both scripts automatically detect existing files and resume without manual intervention
+   - dict_gen.py will skip already-written words and continue in the next file
+   - crack_runner.py will skip already-tried files and continue with the next one
+   - No cleanup or `--force` flag needed—resume is designed to be safe and non-destructive
+   - Different parameters (seed, `--min-length`, `--max-length`, etc.) on resume may produce inconsistent results
+6. **Performance Mode**: Use `--performance` for GPU acceleration with sensible defaults:
    - **Default (`--workload 3`)**: Balances speed and system responsiveness; suitable for most scenarios
    - **High (`--workload 4`)**: Maximum speed but GPU becomes unresponsive; use only for dedicated recovery machines
    - **Low (`--workload 1`)**: Minimal system impact; use when running alongside other tasks
    - Note: Some hash types with `-O` flag cap password length; check hashcat docs if needed
-6. **Custom Optimization**: For fine-tuned control, skip `--performance` and use `--hashcat-args` directly
-7. **Resume**: If interrupted, rerun with the same `--work-dir` and `--prefix` (use `--force` to clear stale files)
+7. **Custom Optimization**: For fine-tuned control, skip `--performance` and use `--hashcat-args` directly
 
 ## Troubleshooting
 
