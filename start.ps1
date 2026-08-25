@@ -106,13 +106,13 @@ function Read-DictGenArgs {
         $parts.Add("--max-repeat"); $parts.Add($maxRepeat)
     }
 
-    Write-Host "  Split generated dictionary files by size or by word count (blank both to skip):" -ForegroundColor DarkGray
+    Write-Host "  Split generated dictionary files by size or by word count:" -ForegroundColor DarkGray
     $splitSize = Read-Host "  Split by file size, e.g. 10MB, 500K, 2GiB (blank = skip)"
     if (-not [string]::IsNullOrWhiteSpace($splitSize)) {
         $parts.Add("--split-size"); $parts.Add($splitSize)
     } else {
-        $splitCount = Read-Host "  Split by word count, e.g. 1000000 (blank = skip)"
-        if (-not [string]::IsNullOrWhiteSpace($splitCount)) {
+        $splitCount = Read-NonEmpty -Prompt "  Split by word count (or 'skip')" -Default "1000000"
+        if ($splitCount.Trim().ToLower() -ne 'skip') {
             $parts.Add("--split-count"); $parts.Add($splitCount)
         }
     }
