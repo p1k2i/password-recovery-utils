@@ -571,16 +571,20 @@ def main() -> int:
     if processed:
         resume_dictgen_args = ["--skip-count", str(cumulative_words), "--start-index", str(max(processed))]
 
-    # Clear any dictionary files still on disk from a previous, now-dead
-    # generator process before starting a new one. dict_gen.py writes ahead
-    # of what hashcat has consumed, so an interrupted run can leave files
-    # *beyond* the one actually being attacked at the time (e.g. hashcat is
-    # still working on out-4.txt while the generator has already raced ahead
-    # and started out-5.txt). Left in place, such a stale higher-index file
-    # would satisfy the "next file exists" readiness check below for the
-    # file the new generator is still writing, handing it to hashcat mid-write
-    # and silently skipping every word not yet generated at that moment.
-    stale = discover_files(work_dir, args.prefix)
+    # Clear any *unprocessed* dictionary files still on disk from a
+    # previous, now-dead generator process before starting a new one.
+    # dict_gen.py writes ahead of what hashcat has consumed, so an
+    # interrupted run can leave files *beyond* the one actually being
+    # attacked at the time (e.g. hashcat is still working on out-4.txt
+    # while the generator has already raced ahead and started out-5.txt).
+    # Left in place, such a stale higher-index file would satisfy the
+    # "next file exists" readiness check below for the file the new
+    # generator is still writing, handing it to hashcat mid-write and
+    # silently skipping every word not yet generated at that moment.
+    # Only indices NOT in `processed` are touched -- a file for an index
+    # already confirmed fully attacked is left alone, so --keep-dictionaries
+    # still gets to keep it instead of having it wiped on every --resume.
+    stale = {i: p for i, p in discover_files(work_dir, args.prefix).items() if i not in processed}
     for path in stale.values():
         safe_unlink(path, logger)
     if stale:
