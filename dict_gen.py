@@ -822,7 +822,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume", action="store_true",
         help="Resume generation from where a previous run left off: detect existing output files, "
-             "skip words already written, and continue generation in the next file")
+             "skip words already written, and continue generation in the next file. Mutually "
+             "exclusive with --skip-count/--start-index.")
+    parser.add_argument(
+        "--skip-count", type=int, default=None,
+        help="Skip the first N valid candidates without writing them, then continue generation "
+             "normally from candidate N+1. Unlike --resume, this doesn't need any previously "
+             "generated files to still be on disk -- the caller just states how many words were "
+             "already produced. Used together with --start-index by crack_runner.py to resume "
+             "exactly where a previous run left off even though it deletes each dictionary file "
+             "right after hashcat has tried it. Mutually exclusive with --resume.")
+    parser.add_argument(
+        "--start-index", type=int, default=0,
+        help="Number output files starting after N instead of from 1, e.g. --start-index 3 writes "
+             "<prefix>-4.txt first. Used together with --skip-count; see its help.")
     parser.add_argument(
         "--quiet", action="store_true",
         help="Suppress the live progress display")
@@ -843,6 +856,14 @@ def main() -> None:
         parser.error("--split-size must be > 0")
     if args.max_repeat is not None and args.max_repeat <= 0:
         parser.error("--max-repeat must be > 0")
+    if args.skip_count is not None and args.skip_count < 0:
+        parser.error("--skip-count must be >= 0")
+    if args.start_index < 0:
+        parser.error("--start-index must be >= 0")
+    if args.resume and (args.skip_count is not None or args.start_index):
+        parser.error("--resume cannot be combined with --skip-count/--start-index -- they are two "
+                      "different ways to resume (detecting existing files vs. explicit counts), "
+                      "pick one")
 
     try:
         rules = load_dictionary(args.dictionary)
@@ -857,7 +878,13 @@ def main() -> None:
     start_file_index = 0
     resume_msg = ""
 
-    if args.resume:
+    if args.skip_count is not None or args.start_index:
+        skip_count = args.skip_count or 0
+        start_file_index = args.start_index
+        resume_msg = f" (resuming: skipping first {skip_count:,} words, starting at file {start_file_index + 1})"
+        print(f"[dict_gen] Resuming generation: skipping first {skip_count:,} words, "
+              f"starting at file {start_file_index + 1}", file=sys.stderr)
+    elif args.resume:
         existing_files = discover_existing_files(args.out_dir, args.prefix)
         if existing_files:
             skip_count = count_existing_words(existing_files)

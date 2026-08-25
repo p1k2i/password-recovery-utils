@@ -40,14 +40,16 @@ run folder, so the folder can be copied to another machine or location
 and resumed there as long as dict_gen.py/crack_runner.py and hashcat are
 available on that machine too.
 
-Resuming re-runs dict_gen.py from scratch -- generation is fully
-deterministic (same seed and arguments always produce byte-identical
-files in the same order), so this regenerates exactly the same
-dictionary files as before at low CPU cost. Any file already recorded as
-processed is recognized and skipped (deleted without wasting a hashcat
-run on it) the moment it reappears; hashcat only resumes attacking from
-the first word list that wasn't tried yet, so no GPU time is wasted
-redoing already-tried passwords.
+Resuming tells dict_gen.py (via its --skip-count/--start-index flags) how
+many words and files were already attacked in the previous invocation --
+generation is fully deterministic (same seed and arguments always
+produce the same words in the same order), so it picks up generating
+and numbering files right after them (e.g. out-4.txt, out-5.txt, ...)
+instead of restarting from out-1.txt. hashcat only resumes attacking
+from the first word list that wasn't tried yet, so no GPU time is wasted
+redoing already-tried passwords, and no CPU/disk time is wasted
+regenerating and discarding files already known not to contain the
+password.
 """
 
 import argparse
@@ -551,16 +553,28 @@ def main() -> int:
     if total_estimate:
         logger.info("ESTIMATE total_words=%s approx=%s", f"{total_estimate:,}", approx)
 
-    generator = start_generator(
-        args.python, dict_gen_script, args.seed, work_dir, args.prefix,
-        dictgen_extra, work_dir / "dictgen.log", logger,
-    )
-
     processed: set = set(state["processed"])
     skipped_cleanup: set = set()
     cracked_output: Optional[str] = state.get("cracked_output")
     exit_code = 1
     cumulative_words = state["cumulative_words"]
+
+    # Files already attacked in a prior invocation are deleted as soon as
+    # hashcat is done with them (see the main loop below), so on --resume
+    # there is nothing left on disk for dict_gen.py's own --resume to
+    # detect. Tell it explicitly how many words and files that was instead,
+    # via --skip-count/--start-index, so generation picks up right after
+    # them -- deterministic, so this reproduces the exact same words dict_gen
+    # would have produced there -- instead of restarting file numbering (and
+    # writing/discarding already-tried words) from out-1.txt every time.
+    resume_dictgen_args = []
+    if processed:
+        resume_dictgen_args = ["--skip-count", str(cumulative_words), "--start-index", str(max(processed))]
+
+    generator = start_generator(
+        args.python, dict_gen_script, args.seed, work_dir, args.prefix,
+        dictgen_extra + resume_dictgen_args, work_dir / "dictgen.log", logger,
+    )
 
     def progress_suffix() -> str:
         if not total_estimate:
